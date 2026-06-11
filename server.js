@@ -31,7 +31,7 @@ const LASTFM_BASE        = 'https://ws.audioscrobbler.com/2.0/';
 const PORT               = process.env.PORT || 3001;
 
 /* ── Firebase config ── */
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'fir-project-id-b56fc';
+const FIREBASE_PROJECT_ID   = process.env.FIREBASE_PROJECT_ID   || 'YOUR_FIREBASE_PROJECT_ID';
 const FIREBASE_CREDENTIALS  = process.env.GOOGLE_APPLICATION_CREDENTIALS || path.join(__dirname, 'firebase-credentials.json');
 
 /* ════════════════════════════════════════════════════════════
@@ -642,3 +642,19 @@ server.on('error', err => {
 });
 process.on('SIGTERM', () => { localPersist(); server.close(() => process.exit(0)); });
 process.on('SIGINT',  () => { localPersist(); server.close(() => process.exit(0)); });
+
+/* ── Keep-alive: ping self every 14 minutes to prevent Render free tier sleep ── */
+function keepAlive() {
+  const selfUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  try {
+    const mod = selfUrl.startsWith('https') ? require('https') : require('http');
+    const parsed = new url.URL(selfUrl + '/api/health');
+    const req = mod.request({ hostname: parsed.hostname, path: parsed.pathname, method: 'GET', timeout: 8000 }, res => {
+      console.log(`[keep-alive] ping → ${res.statusCode}`);
+    });
+    req.on('error', () => {});
+    req.end();
+  } catch(e) {}
+}
+// Start keep-alive after 1 minute, then every 14 minutes
+setTimeout(() => { keepAlive(); setInterval(keepAlive, 14 * 60 * 1000); }, 60 * 1000);
