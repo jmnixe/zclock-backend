@@ -31,7 +31,7 @@ const LASTFM_BASE        = 'https://ws.audioscrobbler.com/2.0/';
 const PORT               = process.env.PORT || 3001;
 
 /* ── Firebase config ── */
-const FIREBASE_PROJECT_ID   = process.env.FIREBASE_PROJECT_ID   || 'YOUR_FIREBASE_PROJECT_ID';
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'fir-project-id-b56fc';
 const FIREBASE_CREDENTIALS  = process.env.GOOGLE_APPLICATION_CREDENTIALS || path.join(__dirname, 'firebase-credentials.json');
 
 /* ════════════════════════════════════════════════════════════
@@ -342,22 +342,47 @@ async function syncLastFm(memberId, profileUrl, memberTeam) {
   syncDoc.lastfm.status        = earned > 0 ? 'HP added successfully' : rawNew > 0 ? 'Synced' : 'No new streams';
   await dbSaveSyncData(memberId, syncDoc);
 
-  /* Update member HP in shared DB */
+  /* Update member HP + streams in shared DB — safety: totals never decrease */
+  const member = await dbGetMember(memberId) || {};
+  const oldTotalHp = member.totalHp || 0;
+  const oldTotalStreams = member.totalStreams || member.streams || 0;
+
+  const newWeeklyStreams = (member.streams || 0) + rawNew;
+  const newTotalStreams  = Math.max(oldTotalStreams + rawNew, oldTotalStreams);
+  const newWeeklyHp     = (member.hp || 0) + earned;
+  const newTotalHp      = Math.max(oldTotalHp + earned, oldTotalHp);
+
+  const updates = {
+    streams:           newWeeklyStreams,
+    weeklyStreams:     newWeeklyStreams,
+    totalStreams:      newTotalStreams,
+    lifetimeStreams:   newTotalStreams,
+  };
   if (earned > 0) {
-    const member = await dbGetMember(memberId) || {};
-    const updates = {
-      hp:           (member.hp         || 0) + earned,
-      totalHp:      (member.totalHp    || 0) + earned,
-      weeklyHp:     (member.weeklyHp   || 0) + earned,
-      hpStreaming:  (member.hpStreaming || 0) + earned,
-      streams:      (member.streams    || 0) + rawNew,
-      weeklyStreams: (member.weeklyStreams || 0) + rawNew,
-    };
+    updates.hp          = newWeeklyHp;
+    updates.weeklyHp    = newWeeklyHp;
+    updates.totalHp     = newTotalHp;
+    updates.hpStreaming = (member.hpStreaming || 0) + earned;
+  }
+  if (rawNew > 0 || earned > 0) {
     await dbSaveMember(memberId, updates);
     await dbAddNotification('stream', `${memberId} synced: +${rawNew} streams → +${earned} HP`, { memberId, username, earned, newStreams: rawNew, team: memberTeam });
   }
 
-  return { success: true, firstSync: false, status: syncDoc.lastfm.status, username, newStreams: rawNew, earnedHP: earned, pending: newPending };
+  /* Fetch recent tracks for frontend track/album/mission matching */
+  let recentTracks = [];
+  try {
+    const tracksResp = await fetchJSON(`${LASTFM_BASE}?method=user.getrecenttracks&user=${encodeURIComponent(username)}&api_key=${LASTFM_API_KEY}&format=json&limit=200`);
+    if (tracksResp.status === 200 && tracksResp.data?.recenttracks?.track) {
+      const raw = tracksResp.data.recenttracks.track;
+      recentTracks = (Array.isArray(raw) ? raw : [raw])
+        .filter(t => !t['@attr']?.nowplaying)
+        .map(t => ({ name: (t.name||'').trim(), artist: (t.artist?.['#text']||t.artist||'').trim(), album: (t.album?.['#text']||t.album||'').trim() }))
+        .filter(t => t.name);
+    }
+  } catch(e) {}
+
+  return { success: true, firstSync: false, status: syncDoc.lastfm.status, username, newStreams: rawNew, earnedHP: earned, pending: newPending, newTracksList: recentTracks };
 }
 
 async function syncStatsFm(memberId, profileUrl) {
@@ -503,7 +528,7 @@ const server = http.createServer(async (req, res) => {
       if (!tasks.length) return sendJSON(res, 200, { success: false, status: 'No platforms connected' });
       const results = await Promise.allSettled(tasks);
       const lfResult = results[0]?.value;
-      return sendJSON(res, 200, { success: true, lastfm: lfResult, totalEarnedHP: lfResult?.earnedHP || 0 });
+      return sendJSON(res, 200, { success: true, lastfm: lfResult, totalEarnedHP: lfResult?.earnedHP || 0, newTracksList: lfResult?.newTracksList || [] });
     } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
   }
 
@@ -622,6 +647,67 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  /* ── USER STATS ── */
+  if (pathname.startsWith('/api/user/') && pathname.endsWith('/stats') && method === 'GET') {
+    const uid = decodeURIComponent(pathname.replace('/api/user/','').replace('/stats',''));
+    const member = await dbGetMember(uid) || {};
+    const syncDoc = await dbGetSyncData(uid) || {};
+    return sendJSON(res, 200, { success: true, uid,
+      weeklyHP: member.hp || 0, totalHP: member.totalHp || 0,
+      weeklyStreams: member.streams || 0, totalStreams: member.totalStreams || member.lifetimeStreams || 0,
+      level: Math.floor((member.totalHp || 0) / 1000) + 1,
+      lastSync: syncDoc.lastfm?.lastSync || null,
+      username: syncDoc.lastfm?.username || uid,
+    });
+  }
+
+  /* ── TEAM STATS ── */
+  if (pathname === '/api/team/stats' && method === 'GET') {
+    const allM = await dbGetAllMembers();
+    const stats = { hyung: { totalHP:0, weeklyHP:0, totalStreams:0, weeklyStreams:0, members:0 }, maknae: { totalHP:0, weeklyHP:0, totalStreams:0, weeklyStreams:0, members:0 } };
+    Object.values(allM).forEach(m => {
+      const t = (m.team||'').toLowerCase().includes('hyung') ? 'hyung' : 'maknae';
+      stats[t].totalHP      += m.totalHp     || 0;
+      stats[t].weeklyHP     += m.hp          || 0;
+      stats[t].totalStreams  += m.totalStreams || m.lifetimeStreams || 0;
+      stats[t].weeklyStreams += m.streams     || 0;
+      stats[t].members++;
+    });
+    return sendJSON(res, 200, { success: true, teams: stats });
+  }
+
+  /* ── MISSION PROGRESS ── */
+  if (pathname.startsWith('/api/missions/progress/') && method === 'GET') {
+    const uid = decodeURIComponent(pathname.replace('/api/missions/progress/',''));
+    if (!db) return sendJSON(res, 200, { success: false, error: 'Firebase not ready', tracks: [], albums: [], missions: [] });
+    try {
+      const [tSnap, aSnap, mSnap] = await Promise.all([
+        db.collection('memberTrackProgress').where('memberUid','==',uid).get(),
+        db.collection('memberAlbumProgress').where('memberUid','==',uid).get(),
+        db.collection('memberMissionProgress').where('memberUid','==',uid).get(),
+      ]);
+      return sendJSON(res, 200, {
+        success: true,
+        tracks:   tSnap.docs.map(d => d.data()),
+        albums:   aSnap.docs.map(d => d.data()),
+        missions: mSnap.docs.map(d => d.data()),
+      });
+    } catch(e) { return sendJSON(res, 200, { success: false, error: e.message }); }
+  }
+
+  /* ── ADMIN SYNC ALL USERS ── */
+  if (pathname === '/api/sync/all' && method === 'POST') {
+    const allM = await dbGetAllMembers();
+    const results = {};
+    await Promise.allSettled(Object.keys(allM).map(async uid => {
+      const syncDoc = await dbGetSyncData(uid);
+      if (syncDoc?.lastfm?.profileUrl) {
+        results[uid] = await syncLastFm(uid, syncDoc.lastfm.profileUrl, allM[uid]?.team || '').catch(e => ({ success: false, error: e.message }));
+      }
+    }));
+    return sendJSON(res, 200, { success: true, results, synced: Object.keys(results).length });
+  }
+
   /* Last.fm tracks proxy */
   if (pathname.startsWith('/api/lastfm-tracks/') && method === 'GET') {
     const lfUser = decodeURIComponent(pathname.replace('/api/lastfm-tracks/', ''));
@@ -629,31 +715,24 @@ const server = http.createServer(async (req, res) => {
       const lfUrl = `${LASTFM_BASE}?method=user.getrecenttracks&user=${encodeURIComponent(lfUser)}&api_key=${LASTFM_API_KEY}&format=json&limit=200`;
       const mod = require('https');
       const data = await new Promise((resolve, reject) => {
-        mod.get(lfUrl, r => {
-          let d = '';
-          r.on('data', c => d += c);
-          r.on('end', () => resolve(JSON.parse(d)));
-        }).on('error', reject);
+        mod.get(lfUrl, r => { let d=''; r.on('data',c=>d+=c); r.on('end',()=>resolve(JSON.parse(d))); }).on('error',reject);
       });
       if (data.error) return sendJSON(res, 200, { success: false, error: data.message, tracks: [] });
       const rawTracks = data?.recenttracks?.track || [];
       const tracks = (Array.isArray(rawTracks) ? rawTracks : [rawTracks])
         .filter(t => !t['@attr']?.nowplaying)
-        .map(t => ({ name: (t.name||'').trim(), artist: (t.artist?.['#text']||t.artist||'').trim(), album: (t.album?.['#text']||t.album||'').trim() }))
+        .map(t => ({ name:(t.name||'').trim(), artist:(t.artist?.['#text']||t.artist||'').trim(), album:(t.album?.['#text']||t.album||'').trim() }))
         .filter(t => t.name);
       return sendJSON(res, 200, { success: true, tracks, count: tracks.length });
-    } catch(e) {
-      return sendJSON(res, 200, { success: false, error: e.message, tracks: [] });
-    }
+    } catch(e) { return sendJSON(res, 200, { success: false, error: e.message, tracks: [] }); }
   }
-sendJSON(res, 404, { error: 'Not found' });
 
+  sendJSON(res, 404, { error: 'Not found' });
+});
 
 /* ── Start ── */
 initFirebase();
-
-
-});
+server.listen(PORT, () => {
   console.log(`\n╔══════════════════════════════════════════════╗`);
   console.log(`  ZCLOCK BACKEND  running on port ${PORT}`);
   console.log(`  Database: ${firebaseReady ? 'Firebase Firestore ✅' : 'Local file (add firebase-credentials.json for multi-device)'}`);
@@ -667,19 +746,3 @@ server.on('error', err => {
 });
 process.on('SIGTERM', () => { localPersist(); server.close(() => process.exit(0)); });
 process.on('SIGINT',  () => { localPersist(); server.close(() => process.exit(0)); });
-
-/* ── Keep-alive: ping self every 14 minutes to prevent Render free tier sleep ── */
-function keepAlive() {
-  const selfUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-  try {
-    const mod = selfUrl.startsWith('https') ? require('https') : require('http');
-    const parsed = new url.URL(selfUrl + '/api/health');
-    const req = mod.request({ hostname: parsed.hostname, path: parsed.pathname, method: 'GET', timeout: 8000 }, res => {
-      console.log(`[keep-alive] ping → ${res.statusCode}`);
-    });
-    req.on('error', () => {});
-    req.end();
-  } catch(e) {}
-}
-// Start keep-alive after 1 minute, then every 14 minutes
-setTimeout(() => { keepAlive(); setInterval(keepAlive, 14 * 60 * 1000); }, 60 * 1000);
