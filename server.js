@@ -622,6 +622,31 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  /* Last.fm tracks proxy */
+  if (pathname.startsWith('/api/lastfm-tracks/') && method === 'GET') {
+    const lfUser = decodeURIComponent(pathname.replace('/api/lastfm-tracks/', ''));
+    try {
+      const lfUrl = `${LASTFM_BASE}?method=user.getrecenttracks&user=${encodeURIComponent(lfUser)}&api_key=${LASTFM_API_KEY}&format=json&limit=200`;
+      const mod = require('https');
+      const data = await new Promise((resolve, reject) => {
+        mod.get(lfUrl, r => {
+          let d = '';
+          r.on('data', c => d += c);
+          r.on('end', () => resolve(JSON.parse(d)));
+        }).on('error', reject);
+      });
+      if (data.error) return sendJSON(res, 200, { success: false, error: data.message, tracks: [] });
+      const rawTracks = data?.recenttracks?.track || [];
+      const tracks = (Array.isArray(rawTracks) ? rawTracks : [rawTracks])
+        .filter(t => !t['@attr']?.nowplaying)
+        .map(t => ({ name: (t.name||'').trim(), artist: (t.artist?.['#text']||t.artist||'').trim(), album: (t.album?.['#text']||t.album||'').trim() }))
+        .filter(t => t.name);
+      return sendJSON(res, 200, { success: true, tracks, count: tracks.length });
+    } catch(e) {
+      return sendJSON(res, 200, { success: false, error: e.message, tracks: [] });
+    }
+  }
+
   sendJSON(res, 404, { error: 'Not found' });
 });
 
