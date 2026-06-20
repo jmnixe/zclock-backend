@@ -646,32 +646,13 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { success: false, error: e.message, tracks: [] });
     }
   }
-
+sendJSON(res, 404, { error: 'Not found' });
 
 
 /* ── Start ── */
 initFirebase();
 
-server.listen(PORT, () => {
-   app.get('/api/lastfm-tracks/:username', async (req, res) => {
-  const { username } = req.params;
-  if (!username) return res.json({ success: false, tracks: [] });
-  const LASTFM_API_KEY = process.env.LASTFM_API_KEY || '';
-  if (!LASTFM_API_KEY) return res.json({ success: false, error: 'LASTFM_API_KEY not set', tracks: [] });
-  try {
-    const url = `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user=${encodeURIComponent(username)}&api_key=${LASTFM_API_KEY}&format=json&limit=200`;
-    const response = await fetch(url);
-    const data = await response.json();
-    if (data.error) return res.json({ success: false, error: data.message, tracks: [] });
-    const rawTracks = data?.recenttracks?.track || [];
-    const tracks = (Array.isArray(rawTracks) ? rawTracks : [rawTracks])
-      .filter(t => !t['@attr']?.nowplaying)
-      .map(t => ({ name: (t.name||'').trim(), artist: (t.artist?.['#text']||t.artist||'').trim(), album: (t.album?.['#text']||t.album||'').trim() }))
-      .filter(t => t.name);
-    res.json({ success: true, tracks, count: tracks.length });
-  } catch(e) {
-    res.json({ success: false, error: e.message, tracks: [] });
-  }
+
 });
   console.log(`\n╔══════════════════════════════════════════════╗`);
   console.log(`  ZCLOCK BACKEND  running on port ${PORT}`);
