@@ -647,8 +647,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  sendJSON(res, 404, { error: 'Not found' });
-});
+
 
 /* ── Start ── */
 initFirebase();
