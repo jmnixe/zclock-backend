@@ -344,25 +344,27 @@ async function syncLastFm(memberId, profileUrl, memberTeam) {
 
   /* Update member HP + streams in shared DB — safety: totals never decrease */
   const member = await dbGetMember(memberId) || {};
-  const oldTotalHp = member.totalHp || 0;
-  const oldTotalStreams = member.totalStreams || member.streams || 0;
+  const oldTotalHp      = member.totalHp      || 0;
+  const oldTotalStreams  = member.totalStreams  || member.lifetimeStreams || 0;
+  const oldWeeklyStreams = member.streams       || member.weeklyStreams   || 0;
+  const oldWeeklyHp     = member.hp            || member.weeklyHp        || 0;
 
-  const newWeeklyStreams = (member.streams || 0) + rawNew;
-  const newTotalStreams  = Math.max(oldTotalStreams + rawNew, oldTotalStreams);
-  const newWeeklyHp     = (member.hp || 0) + earned;
-  const newTotalHp      = Math.max(oldTotalHp + earned, oldTotalHp);
+  const newWeeklyStreams = oldWeeklyStreams + rawNew;
+  const newTotalStreams  = Math.max(oldTotalStreams + rawNew, newWeeklyStreams); // safety: total >= weekly
+  const newWeeklyHp     = oldWeeklyHp + earned;
+  const newTotalHp      = Math.max(oldTotalHp + earned, newWeeklyHp);           // safety: total >= weekly
 
   const updates = {
-    streams:           newWeeklyStreams,
-    weeklyStreams:     newWeeklyStreams,
-    totalStreams:      newTotalStreams,
-    lifetimeStreams:   newTotalStreams,
+    streams:         newWeeklyStreams,
+    weeklyStreams:   newWeeklyStreams,
+    totalStreams:    newTotalStreams,
+    lifetimeStreams: newTotalStreams,
   };
   if (earned > 0) {
     updates.hp          = newWeeklyHp;
     updates.weeklyHp    = newWeeklyHp;
     updates.totalHp     = newTotalHp;
-    updates.hpStreaming = (member.hpStreaming || 0) + earned;
+    updates.hpStreaming  = (member.hpStreaming || 0) + earned;
   }
   if (rawNew > 0 || earned > 0) {
     await dbSaveMember(memberId, updates);
@@ -645,6 +647,40 @@ const server = http.createServer(async (req, res) => {
       time: new Date().toISOString(),
       version: '2.0.0',
     });
+  }
+
+  /* ── REPAIR CORRUPTED STREAM/HP DATA ── */
+  if (pathname === '/api/admin/repair-totals' && method === 'POST') {
+    if (!db) return sendJSON(res, 200, { success: false, error: 'Firebase not ready' });
+    try {
+      const allM = await dbGetAllMembers();
+      const repairs = [];
+      await Promise.allSettled(Object.entries(allM).map(async ([uid, m]) => {
+        const updates = {};
+        const weeklyStreams = m.streams || m.weeklyStreams || 0;
+        const totalStreams  = m.totalStreams || m.lifetimeStreams || 0;
+        const weeklyHp     = m.hp || m.weeklyHp || 0;
+        const totalHp      = m.totalHp || 0;
+        // Safety: total must always >= weekly
+        if (weeklyStreams > totalStreams) {
+          updates.totalStreams    = weeklyStreams;
+          updates.lifetimeStreams = weeklyStreams;
+        }
+        if (weeklyHp > totalHp) {
+          updates.totalHp = weeklyHp;
+        }
+        // Ensure all 4 fields exist
+        if (!m.totalStreams)    updates.totalStreams    = Math.max(totalStreams, weeklyStreams);
+        if (!m.lifetimeStreams) updates.lifetimeStreams = Math.max(totalStreams, weeklyStreams);
+        if (!m.weeklyStreams)   updates.weeklyStreams   = weeklyStreams;
+        if (!m.weeklyHp)       updates.weeklyHp        = weeklyHp;
+        if (Object.keys(updates).length > 0) {
+          await dbSaveMember(uid, updates);
+          repairs.push({ uid, updates });
+        }
+      }));
+      return sendJSON(res, 200, { success: true, repaired: repairs.length, repairs });
+    } catch(e) { return sendJSON(res, 200, { success: false, error: e.message }); }
   }
 
   /* ── USER STATS ── */
