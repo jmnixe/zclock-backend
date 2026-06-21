@@ -757,6 +757,18 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, { success: true, results, synced: Object.keys(results).length });
   }
 
+  /* Last.fm total playcount — used by frontend stream counter */
+  if (pathname.startsWith('/api/lastfm-count/') && method === 'GET') {
+    const lfUser = decodeURIComponent(pathname.replace('/api/lastfm-count/', ''));
+    try {
+      const r = await fetchJSON(`${LASTFM_BASE}?method=user.getinfo&user=${encodeURIComponent(lfUser)}&api_key=${LASTFM_API_KEY}&format=json`);
+      if (r.status === 200 && r.data?.user?.playcount) {
+        return sendJSON(res, 200, { success: true, playcount: parseInt(r.data.user.playcount), username: lfUser });
+      }
+      return sendJSON(res, 200, { success: false, playcount: null });
+    } catch(e) { return sendJSON(res, 200, { success: false, playcount: null }); }
+  }
+
   /* Last.fm tracks proxy */
   if (pathname.startsWith('/api/lastfm-tracks/') && method === 'GET') {
     const lfUser = decodeURIComponent(pathname.replace('/api/lastfm-tracks/', ''));
