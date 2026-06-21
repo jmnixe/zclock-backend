@@ -537,7 +537,13 @@ const server = http.createServer(async (req, res) => {
       if (!tasks.length) return sendJSON(res, 200, { success: false, status: 'No platforms connected' });
       const results = await Promise.allSettled(tasks);
       const lfResult = results[0]?.value;
-      return sendJSON(res, 200, { success: true, lastfm: lfResult, totalEarnedHP: lfResult?.earnedHP || 0, newTracksList: lfResult?.newTracksList || [] });
+      return sendJSON(res, 200, {
+        success: true,
+        lastfm: lfResult,
+        totalEarnedHP: lfResult?.earnedHP || 0,
+        newStreams: lfResult?.newStreams || 0,
+        newTracksList: lfResult?.newTracksList || []
+      });
     } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
   }
 
