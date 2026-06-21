@@ -415,10 +415,17 @@ async function registerMember(memberData) {
   if (!username) return { success: false, error: 'Username required' };
   const existing = await dbGetMember(username);
   if (existing) return { success: false, error: 'Username already taken' };
+  // Check banned/deleted usernames
+  if (db) {
+    try {
+      const banned = await db.collection('bannedUsernames').doc(username.toLowerCase()).get();
+      if (banned.exists) return { success: false, error: 'This username is not available' };
+    } catch(e) {}
+  }
   const record = {
     ...memberData,
     hp: 0, totalHp: 0, weeklyHp: 0, hpStreaming: 0, hpVoting: 0, hpMissions: 0, hpGames: 0, hpAttendance: 0,
-    streams: 0, weeklyStreams: 0, votesToday: 0,
+    streams: 0, weeklyStreams: 0, totalStreams: 0, lifetimeStreams: 0, votesToday: 0,
     completedMissions: [], completedGames: [],
     joinedAt: new Date().toISOString(),
     lastActive: new Date().toISOString(),
