@@ -387,6 +387,88 @@ async function syncLastFm(memberId, profileUrl, memberTeam) {
   return { success: true, firstSync: false, status: syncDoc.lastfm.status, username, newStreams: rawNew, earnedHP: earned, pending: newPending, newTracksList: recentTracks };
 }
 
+/* ═══════════════════════════════════════════════════════════
+   LISTENBRAINZ SYNC — uses ListenBrainz public API
+   No API key required for public listen counts.
+   ═══════════════════════════════════════════════════════════ */
+async function syncListenBrainz(memberId, lbUsername, memberTeam) {
+  if (!lbUsername) return { success: false, status: 'No ListenBrainz username' };
+
+  // Fetch total listen count from ListenBrainz public API
+  let totalListens = null;
+  try {
+    const r = await fetchJSON(`https://api.listenbrainz.org/1/user/${encodeURIComponent(lbUsername)}/listen-count`);
+    if (r.status === 200 && r.data?.payload?.count !== undefined) {
+      totalListens = parseInt(r.data.payload.count);
+    } else {
+      return { success: false, status: 'ListenBrainz user not found' };
+    }
+  } catch(e) {
+    return { success: false, status: 'ListenBrainz unavailable' };
+  }
+
+  // Get sync doc
+  let syncDoc = await dbGetSyncData(memberId) || {};
+  syncDoc.lb = syncDoc.lb || { savedCount: null, pending: 0, earnedHP: 0, firstSyncDone: false };
+  syncDoc.lb.username = lbUsername;
+
+  // First sync — save anchor, 0 HP
+  if (syncDoc.lb.savedCount === null || !syncDoc.lb.firstSyncDone) {
+    syncDoc.lb.savedCount   = totalListens;
+    syncDoc.lb.pending      = 0;
+    syncDoc.lb.firstSyncDone = true;
+    syncDoc.lb.lastSync     = new Date().toISOString();
+    syncDoc.lb.status       = 'Connected';
+    await dbSaveSyncData(memberId, syncDoc);
+    await dbAddNotification('sync', `${memberId} connected ListenBrainz (${lbUsername}) — anchor: ${totalListens.toLocaleString()}`, { memberId, lbUsername, startingCount: totalListens });
+    // Log first sync
+    if (db) db.collection('streamSyncLogs').add({ memberUid: memberId, lbUsername, previousScrobbles: 0, currentScrobbles: totalListens, newStreams: 0, pendingStreams: 0, hpEarned: 0, syncedAt: new Date().toISOString(), type: 'first_sync' }).catch(()=>{});
+    return { success: true, firstSync: true, status: 'Connected', earnedHP: 0, newStreams: 0, pending: 0, username: lbUsername };
+  }
+
+  // Subsequent sync
+  const rawNew = Math.max(0, totalListens - syncDoc.lb.savedCount);
+  const { earned, newPending } = calcHP(rawNew, syncDoc.lb.pending);
+
+  syncDoc.lb.savedCount  = totalListens;
+  syncDoc.lb.pending     = newPending;
+  syncDoc.lb.earnedHP    = (syncDoc.lb.earnedHP || 0) + earned;
+  syncDoc.lb.totalStreams = (syncDoc.lb.totalStreams || 0) + rawNew;
+  syncDoc.lb.lastSync    = new Date().toISOString();
+  syncDoc.lb.lastNewStreams = rawNew;
+  syncDoc.lb.status      = earned > 0 ? 'HP added' : rawNew > 0 ? 'Synced' : 'No new streams';
+  await dbSaveSyncData(memberId, syncDoc);
+
+  // Update member HP + streams
+  const member = await dbGetMember(memberId) || {};
+  const oldTotalHp     = member.totalHp     || 0;
+  const oldTotalStr    = Math.max(member.totalStreams || 0, member.lifetimeStreams || 0);
+  const oldWeeklyStr   = member.streams || 0;
+  const oldWeeklyHp    = member.hp      || 0;
+  const newWeeklyStr   = oldWeeklyStr + rawNew;
+  const newTotalStr    = Math.max(oldTotalStr + rawNew, newWeeklyStr);
+  const newWeeklyHp    = oldWeeklyHp + earned;
+  const newTotalHp     = Math.max(oldTotalHp + earned, newWeeklyHp);
+
+  const updates = {
+    streams: newWeeklyStr, weeklyStreams: newWeeklyStr,
+    totalStreams: newTotalStr, lifetimeStreams: newTotalStr,
+    lastSyncStreams: rawNew, streamsCountedThisSync: rawNew,
+  };
+  if (earned > 0) {
+    updates.hp = newWeeklyHp; updates.weeklyHp = newWeeklyHp;
+    updates.totalHp = newTotalHp; updates.hpStreaming = (member.hpStreaming||0) + earned;
+  }
+  if (rawNew > 0 || earned > 0) {
+    await dbSaveMember(memberId, updates);
+    await dbAddNotification('stream', `${memberId}: +${rawNew} streams → +${earned} HP (${newPending} pending)`, { memberId, lbUsername, earned, newStreams: rawNew, team: memberTeam });
+    // Stream sync log
+    if (db) db.collection('streamSyncLogs').add({ memberUid: memberId, lbUsername, previousScrobbles: syncDoc.lb.savedCount - rawNew, currentScrobbles: totalListens, newStreams: rawNew, pendingStreams: newPending, hpEarned: earned, syncedAt: new Date().toISOString() }).catch(()=>{});
+  }
+
+  return { success: true, firstSync: false, status: syncDoc.lb.status, username: lbUsername, newStreams: rawNew, earnedHP: earned, pending: newPending };
+}
+
 async function syncStatsFm(memberId, profileUrl) {
   const username = (profileUrl.match(/stats\.fm\/user\/([^/?#\s]+)/i)||[])[1] || profileUrl.trim();
   if (!profileUrl.trim()) return { success: false, status: 'Invalid profile URL' };
@@ -528,20 +610,29 @@ const server = http.createServer(async (req, res) => {
     const memberId = decodeURIComponent(pathname.replace('/api/sync-all/', ''));
     try {
       const body = await readBody(req).catch(() => ({}));
-      const syncDoc = await dbGetSyncData(memberId);
-      if (!syncDoc) return sendJSON(res, 200, { success: false, status: 'No platforms connected' });
-      const tasks = [];
-      if (syncDoc.lastfm?.profileUrl)  tasks.push(syncLastFm(memberId, syncDoc.lastfm.profileUrl, body.memberTeam || ''));
-      if (syncDoc.statsfm?.profileUrl) tasks.push(syncStatsFm(memberId, syncDoc.statsfm.profileUrl));
-      if (syncDoc.musicat?.profileUrl) tasks.push(syncMusicat(memberId, syncDoc.musicat.profileUrl));
-      if (!tasks.length) return sendJSON(res, 200, { success: false, status: 'No platforms connected' });
-      const results = await Promise.allSettled(tasks);
-      const lfResult = results[0]?.value;
+      const lbUsername = body.lbUsername || '';
+      const lastfmUrl  = body.lastfmUrl  || '';
+      const memberTeam = body.memberTeam || '';
+      let lfResult;
+      if (lbUsername) {
+        lfResult = await syncListenBrainz(memberId, lbUsername, memberTeam);
+      } else if (lastfmUrl) {
+        lfResult = await syncLastFm(memberId, lastfmUrl, memberTeam);
+      } else {
+        // Try from saved syncDoc
+        const syncDoc = await dbGetSyncData(memberId);
+        if (syncDoc?.lastfm?.profileUrl) {
+          lfResult = await syncLastFm(memberId, syncDoc.lastfm.profileUrl, memberTeam);
+        } else {
+          return sendJSON(res, 200, { success: false, status: 'No streaming platform connected' });
+        }
+      }
       return sendJSON(res, 200, {
-        success: true,
-        lastfm: lfResult,
+        success: true, lastfm: lfResult,
         totalEarnedHP: lfResult?.earnedHP || 0,
-        newStreams: lfResult?.newStreams || 0,
+        newStreams:     lfResult?.newStreams || 0,
+        firstSync:     lfResult?.firstSync || false,
+        pending:       lfResult?.pending || 0,
         newTracksList: lfResult?.newTracksList || []
       });
     } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
@@ -755,6 +846,18 @@ const server = http.createServer(async (req, res) => {
       }
     }));
     return sendJSON(res, 200, { success: true, results, synced: Object.keys(results).length });
+  }
+
+  /* ── ListenBrainz check endpoint ── */
+  if (pathname.startsWith('/api/listenbrainz/check/') && method === 'GET') {
+    const lbUser = decodeURIComponent(pathname.replace('/api/listenbrainz/check/', ''));
+    try {
+      const r = await fetchJSON(`https://api.listenbrainz.org/1/user/${encodeURIComponent(lbUser)}/listen-count`);
+      if (r.status === 200 && r.data?.payload?.count !== undefined) {
+        return sendJSON(res, 200, { success: true, exists: true, username: lbUser, listenCount: r.data.payload.count });
+      }
+      return sendJSON(res, 200, { success: false, exists: false });
+    } catch(e) { return sendJSON(res, 200, { success: false, exists: false, error: e.message }); }
   }
 
   /* Last.fm total playcount — used by frontend stream counter */
