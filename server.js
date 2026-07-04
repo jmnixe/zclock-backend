@@ -285,6 +285,44 @@ function calcHP(newStreams, pending) {
   return { earned: Math.floor(total / 10), newPending: total % 10 };
 }
 
+/* ════════════════════════════════════════════════════════════
+   CENTRAL APPROVED ARTIST LIST — Streaming HP is only ever
+   earned from BTS or approved BTS-member solo/collab tracks.
+   ════════════════════════════════════════════════════════════ */
+const BTS_ARTISTS = [
+  'bts', '방탄소년단', 'bangtan', 'bangtan boys', 'bangtan sonyeondan',
+  'rm', 'kim namjoon', '김남준',
+  'jin', 'kim seokjin', '김석진',
+  'suga', 'agust d', 'min yoongi', '민윤기',
+  'j-hope', 'jhope', 'jung hoseok', '정호석',
+  'jimin', 'park jimin', '박지민',
+  'v', 'kim taehyung', '김태형',
+  'jungkook', 'jeon jungkook', '전정국',
+];
+function isApprovedBtsArtist(name) {
+  if (!name) return false;
+  const n = name.toLowerCase().trim();
+  return BTS_ARTISTS.some(a => n === a || n.includes(a));
+}
+function _normStr(s) { return (s || '').toLowerCase().trim().replace(/\s+/g, ' '); }
+function _streamFingerprint(memberUid, source, artist, track, playedAt) {
+  return `${memberUid}_${source}_${_normStr(artist)}_${_normStr(track)}_${playedAt}`;
+}
+
+/* Real per-listen data from ListenBrainz (artist + track + timestamp),
+   not just the aggregate total-listen-count — required to verify each
+   stream actually belongs to BTS before it can count toward HP. */
+async function fetchListenBrainzListens(username, minTsSeconds) {
+  const url2 = `https://api.listenbrainz.org/1/user/${encodeURIComponent(username)}/listens?min_ts=${minTsSeconds}&count=100`;
+  const r = await fetchJSON(url2);
+  if (r.status !== 200 || !r.data || !r.data.payload || !r.data.payload.listens) return [];
+  return r.data.payload.listens.map(l => ({
+    artist: (l.track_metadata && l.track_metadata.artist_name) || '',
+    track: (l.track_metadata && l.track_metadata.track_name) || '',
+    playedAt: l.listened_at || 0,
+  })).filter(l => l.track && l.playedAt);
+}
+
 async function syncLastFm(memberId, profileUrl, memberTeam) {
   const username = extractLastFmUsername(profileUrl);
   if (!username) return { success: false, status: 'Invalid profile URL' };
@@ -391,82 +429,128 @@ async function syncLastFm(memberId, profileUrl, memberTeam) {
    LISTENBRAINZ SYNC — uses ListenBrainz public API
    No API key required for public listen counts.
    ═══════════════════════════════════════════════════════════ */
-async function syncListenBrainz(memberId, lbUsername, memberTeam) {
+async function syncListenBrainz(memberUid, username, lbUsername, memberTeam) {
   if (!lbUsername) return { success: false, status: 'No ListenBrainz username' };
+  if (!memberUid) return { success: false, status: 'Missing member ID' };
 
-  // Fetch total listen count from ListenBrainz public API
-  let totalListens = null;
-  try {
-    const r = await fetchJSON(`https://api.listenbrainz.org/1/user/${encodeURIComponent(lbUsername)}/listen-count`);
-    if (r.status === 200 && r.data?.payload?.count !== undefined) {
-      totalListens = parseInt(r.data.payload.count);
-    } else {
-      return { success: false, status: 'ListenBrainz user not found' };
-    }
-  } catch(e) {
-    return { success: false, status: 'ListenBrainz unavailable' };
-  }
-
-  // Get sync doc
-  let syncDoc = await dbGetSyncData(memberId) || {};
-  syncDoc.lb = syncDoc.lb || { savedCount: null, pending: 0, earnedHP: 0, firstSyncDone: false };
+  // Get sync doc — keyed by the real Firestore member doc ID (Firebase Auth uid),
+  // NOT username. Previously this used username, which is a *different* document
+  // than the one the frontend actually reads/writes — every HP update the backend
+  // computed was silently orphaned and never reached the member's real profile.
+  let syncDoc = await dbGetSyncData(memberUid) || {};
+  syncDoc.lb = syncDoc.lb || {};
   syncDoc.lb.username = lbUsername;
 
-  // First sync — save anchor, 0 HP
-  if (syncDoc.lb.savedCount === null || !syncDoc.lb.firstSyncDone) {
-    syncDoc.lb.savedCount   = totalListens;
-    syncDoc.lb.pending      = 0;
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // First-ever connection: set a TIME baseline and award 0 HP. No historical
+  // streams are ever imported — only listens strictly after this moment count.
+  if (!syncDoc.lb.firstSyncDone) {
+    syncDoc.lb.lastProcessedTimestamp = nowSec;
+    syncDoc.lb.verifiedBtsStreams = 0;
+    syncDoc.lb.streamingHpAwarded = 0;
+    syncDoc.lb.recentFingerprints = [];
     syncDoc.lb.firstSyncDone = true;
-    syncDoc.lb.lastSync     = new Date().toISOString();
-    syncDoc.lb.status       = 'Connected';
-    await dbSaveSyncData(memberId, syncDoc);
-    await dbAddNotification('sync', `${memberId} connected ListenBrainz (${lbUsername}) — anchor: ${totalListens.toLocaleString()}`, { memberId, lbUsername, startingCount: totalListens });
-    // Log first sync
-    if (db) db.collection('streamSyncLogs').add({ memberUid: memberId, lbUsername, previousScrobbles: 0, currentScrobbles: totalListens, newStreams: 0, pendingStreams: 0, hpEarned: 0, syncedAt: new Date().toISOString(), type: 'first_sync' }).catch(()=>{});
-    return { success: true, firstSync: true, status: 'Connected', earnedHP: 0, newStreams: 0, pending: 0, username: lbUsername };
+    syncDoc.lb.lastSync = new Date().toISOString();
+    syncDoc.lb.status = 'Connected';
+    await dbSaveSyncData(memberUid, syncDoc);
+    await dbAddNotification('sync', `${username} connected ListenBrainz (${lbUsername}) — baseline set, no historical import`, { memberUid, username, lbUsername });
+    if (db) db.collection('streamingHpAudit').add({
+      memberUid, username, source: 'listenbrainz',
+      newVerifiedStreams: 0, rejectedStreams: 0, duplicatesIgnored: 0,
+      hpBefore: 0, hpAwarded: 0, hpAfter: 0,
+      timestamp: new Date().toISOString(), note: 'First connection — baseline set, no historical import',
+    }).catch(()=>{});
+    return { success: true, firstSync: true, status: 'Connected', earnedHP: 0, newStreams: 0, pending: 0, username: lbUsername, newTracksList: [] };
   }
 
-  // Subsequent sync
-  const rawNew = Math.max(0, totalListens - syncDoc.lb.savedCount);
-  const { earned, newPending } = calcHP(rawNew, syncDoc.lb.pending);
+  // Fetch real per-listen data (artist + track + timestamp) since the last
+  // processed point — NOT the aggregate total-listen-count, which counts
+  // every artist a member has ever scrobbled, not just BTS.
+  let listens;
+  try {
+    listens = await fetchListenBrainzListens(lbUsername, syncDoc.lb.lastProcessedTimestamp || nowSec);
+  } catch (e) {
+    return { success: false, status: 'ListenBrainz unavailable' };
+  }
+  listens.sort((a, b) => a.playedAt - b.playedAt); // oldest first, so counters advance chronologically
 
-  syncDoc.lb.savedCount  = totalListens;
-  syncDoc.lb.pending     = newPending;
-  syncDoc.lb.earnedHP    = (syncDoc.lb.earnedHP || 0) + earned;
-  syncDoc.lb.totalStreams = (syncDoc.lb.totalStreams || 0) + rawNew;
-  syncDoc.lb.lastSync    = new Date().toISOString();
-  syncDoc.lb.lastNewStreams = rawNew;
-  syncDoc.lb.status      = earned > 0 ? 'HP added' : rawNew > 0 ? 'Synced' : 'No new streams';
-  await dbSaveSyncData(memberId, syncDoc);
+  const recentFp = new Set(syncDoc.lb.recentFingerprints || []);
+  let acceptedCount = 0, rejectedCount = 0, duplicateCount = 0;
+  const acceptedTracks = [];
+  let maxTs = syncDoc.lb.lastProcessedTimestamp || nowSec;
 
-  // Update member HP + streams
-  const member = await dbGetMember(memberId) || {};
-  const oldTotalHp     = member.totalHp     || 0;
-  const oldTotalStr    = Math.max(member.totalStreams || 0, member.lifetimeStreams || 0);
-  const oldWeeklyStr   = member.streams || 0;
-  const oldWeeklyHp    = member.hp      || 0;
-  const newWeeklyStr   = oldWeeklyStr + rawNew;
-  const newTotalStr    = Math.max(oldTotalStr + rawNew, newWeeklyStr);
-  const newWeeklyHp    = oldWeeklyHp + earned;
-  const newTotalHp     = Math.max(oldTotalHp + earned, newWeeklyHp);
+  for (const l of listens) {
+    maxTs = Math.max(maxTs, l.playedAt);
+    if (!isApprovedBtsArtist(l.artist)) { rejectedCount++; continue; }
+    const fp = _streamFingerprint(memberUid, 'listenbrainz', l.artist, l.track, l.playedAt);
+    if (recentFp.has(fp)) { duplicateCount++; continue; }
+    recentFp.add(fp);
+    acceptedCount++;
+    acceptedTracks.push({ name: l.track, artist: l.artist });
+  }
+  const recentFpArr = Array.from(recentFp).slice(-500); // bounded safety-net, not the primary dedup mechanism
+
+  // Persistent verified counters — HP entitlement is recomputed from the
+  // running verified-stream total each time, and only the DELTA since the
+  // last award is granted. This replaces the old "floor(total/10) re-added
+  // every sync" pattern that could hand out the same HP repeatedly.
+  const hpBefore = syncDoc.lb.streamingHpAwarded || 0;
+  const newVerifiedTotal = (syncDoc.lb.verifiedBtsStreams || 0) + acceptedCount;
+  const newEntitlement = Math.floor(newVerifiedTotal / 10);
+  const earned = Math.max(0, newEntitlement - hpBefore);
+
+  syncDoc.lb.verifiedBtsStreams = newVerifiedTotal;
+  syncDoc.lb.streamingHpAwarded = newEntitlement;
+  syncDoc.lb.lastProcessedTimestamp = maxTs;
+  syncDoc.lb.recentFingerprints = recentFpArr;
+  syncDoc.lb.lastSync = new Date().toISOString();
+  syncDoc.lb.lastNewStreams = acceptedCount;
+  syncDoc.lb.status = earned > 0 ? 'HP added' : acceptedCount > 0 ? 'Synced' : 'No new streams';
+  await dbSaveSyncData(memberUid, syncDoc);
+
+  // Update member HP + streams — keyed by uid (see note above). Totals are
+  // set to absolute values (never re-added as a delta on top of a delta),
+  // and never allowed to decrease.
+  const member = await dbGetMember(memberUid) || {};
+  const oldTotalHp   = member.totalHp || 0;
+  const oldTotalStr  = Math.max(member.totalStreams || 0, member.lifetimeStreams || 0);
+  const oldWeeklyStr = member.streams || 0;
+  const oldWeeklyHp  = member.hp || 0;
+  const newWeeklyStr = oldWeeklyStr + acceptedCount;
+  const newTotalStr  = Math.max(oldTotalStr + acceptedCount, newWeeklyStr);
+  const newWeeklyHp  = oldWeeklyHp + earned;
+  const newTotalHp   = Math.max(oldTotalHp + earned, newWeeklyHp);
 
   const updates = {
     streams: newWeeklyStr, weeklyStreams: newWeeklyStr,
     totalStreams: newTotalStr, lifetimeStreams: newTotalStr,
-    lastSyncStreams: rawNew, streamsCountedThisSync: rawNew,
+    lastSyncStreams: acceptedCount, streamsCountedThisSync: acceptedCount,
   };
   if (earned > 0) {
     updates.hp = newWeeklyHp; updates.weeklyHp = newWeeklyHp;
-    updates.totalHp = newTotalHp; updates.hpStreaming = (member.hpStreaming||0) + earned;
+    updates.totalHp = newTotalHp; updates.hpStreaming = (member.hpStreaming || 0) + earned;
   }
-  if (rawNew > 0 || earned > 0) {
-    await dbSaveMember(memberId, updates);
-    await dbAddNotification('stream', `${memberId}: +${rawNew} streams → +${earned} HP (${newPending} pending)`, { memberId, lbUsername, earned, newStreams: rawNew, team: memberTeam });
-    // Stream sync log
-    if (db) db.collection('streamSyncLogs').add({ memberUid: memberId, lbUsername, previousScrobbles: syncDoc.lb.savedCount - rawNew, currentScrobbles: totalListens, newStreams: rawNew, pendingStreams: newPending, hpEarned: earned, syncedAt: new Date().toISOString() }).catch(()=>{});
+  if (acceptedCount > 0 || earned > 0) {
+    await dbSaveMember(memberUid, updates);
+    await dbAddNotification('stream', `${username}: +${acceptedCount} verified BTS streams → +${earned} HP`, { memberUid, username, lbUsername, earned, newStreams: acceptedCount, team: memberTeam });
   }
 
-  return { success: true, firstSync: false, status: syncDoc.lb.status, username: lbUsername, newStreams: rawNew, earnedHP: earned, pending: newPending };
+  // Audit log — every sync call, so incorrect HP changes can be traced
+  // instead of silently modifying member totals.
+  if (db) db.collection('streamingHpAudit').add({
+    memberUid, username, source: 'listenbrainz',
+    newVerifiedStreams: acceptedCount, rejectedStreams: rejectedCount, duplicatesIgnored: duplicateCount,
+    hpBefore: oldTotalHp, hpAwarded: earned, hpAfter: earned > 0 ? newTotalHp : oldTotalHp,
+    timestamp: new Date().toISOString(),
+  }).catch(()=>{});
+
+  return {
+    success: true, firstSync: false, status: syncDoc.lb.status, username: lbUsername,
+    newStreams: acceptedCount, earnedHP: earned, pending: newVerifiedTotal % 10,
+    newTracksList: acceptedTracks,
+    newTotalHp, newWeeklyHp: newWeeklyHp, newTotalStreams: newTotalStr, newWeeklyStreams: newWeeklyStr, newHpStreaming: (member.hpStreaming || 0) + earned,
+  };
 }
 
 async function syncStatsFm(memberId, profileUrl) {
@@ -679,16 +763,18 @@ const server = http.createServer(async (req, res) => {
       const lbUsername = body.lbUsername || '';
       const lastfmUrl  = body.lastfmUrl  || '';
       const memberTeam = body.memberTeam || '';
+      const memberUid  = body.memberUid || '';
       let lfResult;
       if (lbUsername) {
-        lfResult = await syncListenBrainz(memberId, lbUsername, memberTeam);
+        if (!memberUid) return sendJSON(res, 200, { success: false, status: 'Missing member ID — please refresh and try again' });
+        lfResult = await syncListenBrainz(memberUid, memberId, lbUsername, memberTeam);
       } else if (lastfmUrl) {
-        lfResult = await syncLastFm(memberId, lastfmUrl, memberTeam);
+        lfResult = await syncLastFm(memberUid || memberId, lastfmUrl, memberTeam);
       } else {
         // Try from saved syncDoc
-        const syncDoc = await dbGetSyncData(memberId);
+        const syncDoc = await dbGetSyncData(memberUid || memberId);
         if (syncDoc?.lastfm?.profileUrl) {
-          lfResult = await syncLastFm(memberId, syncDoc.lastfm.profileUrl, memberTeam);
+          lfResult = await syncLastFm(memberUid || memberId, syncDoc.lastfm.profileUrl, memberTeam);
         } else {
           return sendJSON(res, 200, { success: false, status: 'No streaming platform connected' });
         }
@@ -699,7 +785,10 @@ const server = http.createServer(async (req, res) => {
         newStreams:     lfResult?.newStreams || 0,
         firstSync:     lfResult?.firstSync || false,
         pending:       lfResult?.pending || 0,
-        newTracksList: lfResult?.newTracksList || []
+        newTracksList: lfResult?.newTracksList || [],
+        newTotalHp: lfResult?.newTotalHp, newWeeklyHp: lfResult?.newWeeklyHp,
+        newTotalStreams: lfResult?.newTotalStreams, newWeeklyStreams: lfResult?.newWeeklyStreams,
+        newHpStreaming: lfResult?.newHpStreaming,
       });
     } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
   }
