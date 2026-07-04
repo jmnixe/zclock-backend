@@ -433,27 +433,26 @@ async function syncListenBrainz(memberUid, username, lbUsername, memberTeam) {
   if (!lbUsername) return { success: false, status: 'No ListenBrainz username' };
   if (!memberUid) return { success: false, status: 'Missing member ID' };
 
-  // Get sync doc — keyed by the real Firestore member doc ID (Firebase Auth uid),
-  // NOT username. Previously this used username, which is a *different* document
-  // than the one the frontend actually reads/writes — every HP update the backend
-  // computed was silently orphaned and never reached the member's real profile.
-  let syncDoc = await dbGetSyncData(memberUid) || {};
-  syncDoc.lb = syncDoc.lb || {};
-  syncDoc.lb.username = lbUsername;
-
   const nowSec = Math.floor(Date.now() / 1000);
+
+  // Peek at current state (non-transactional) just to know whether this is a
+  // first connection and what min_ts to query ListenBrainz with.
+  let peekDoc = await dbGetSyncData(memberUid) || {};
+  peekDoc.lb = peekDoc.lb || {};
 
   // First-ever connection: set a TIME baseline and award 0 HP. No historical
   // streams are ever imported — only listens strictly after this moment count.
-  if (!syncDoc.lb.firstSyncDone) {
-    syncDoc.lb.lastProcessedTimestamp = nowSec;
-    syncDoc.lb.verifiedBtsStreams = 0;
-    syncDoc.lb.streamingHpAwarded = 0;
-    syncDoc.lb.recentFingerprints = [];
-    syncDoc.lb.firstSyncDone = true;
-    syncDoc.lb.lastSync = new Date().toISOString();
-    syncDoc.lb.status = 'Connected';
-    await dbSaveSyncData(memberUid, syncDoc);
+  // Nothing to race on yet (no prior state), so no transaction needed here.
+  if (!peekDoc.lb.firstSyncDone) {
+    peekDoc.lb.lastProcessedTimestamp = nowSec;
+    peekDoc.lb.verifiedBtsStreams = 0;
+    peekDoc.lb.streamingHpAwarded = 0;
+    peekDoc.lb.recentFingerprints = [];
+    peekDoc.lb.firstSyncDone = true;
+    peekDoc.lb.username = lbUsername;
+    peekDoc.lb.lastSync = new Date().toISOString();
+    peekDoc.lb.status = 'Connected';
+    await dbSaveSyncData(memberUid, peekDoc);
     await dbAddNotification('sync', `${username} connected ListenBrainz (${lbUsername}) — baseline set, no historical import`, { memberUid, username, lbUsername });
     if (db) db.collection('streamingHpAudit').add({
       memberUid, username, source: 'listenbrainz',
@@ -466,90 +465,134 @@ async function syncListenBrainz(memberUid, username, lbUsername, memberTeam) {
 
   // Fetch real per-listen data (artist + track + timestamp) since the last
   // processed point — NOT the aggregate total-listen-count, which counts
-  // every artist a member has ever scrobbled, not just BTS.
+  // every artist a member has ever scrobbled, not just BTS. This is a plain
+  // read-only GET, so it's safe to do outside the transaction below.
   let listens;
   try {
-    listens = await fetchListenBrainzListens(lbUsername, syncDoc.lb.lastProcessedTimestamp || nowSec);
+    listens = await fetchListenBrainzListens(lbUsername, peekDoc.lb.lastProcessedTimestamp || nowSec);
   } catch (e) {
     return { success: false, status: 'ListenBrainz unavailable' };
   }
   listens.sort((a, b) => a.playedAt - b.playedAt); // oldest first, so counters advance chronologically
 
-  const recentFp = new Set(syncDoc.lb.recentFingerprints || []);
-  let acceptedCount = 0, rejectedCount = 0, duplicateCount = 0;
-  const acceptedTracks = [];
-  let maxTs = syncDoc.lb.lastProcessedTimestamp || nowSec;
-
-  for (const l of listens) {
-    maxTs = Math.max(maxTs, l.playedAt);
-    if (!isApprovedBtsArtist(l.artist)) { rejectedCount++; continue; }
-    const fp = _streamFingerprint(memberUid, 'listenbrainz', l.artist, l.track, l.playedAt);
-    if (recentFp.has(fp)) { duplicateCount++; continue; }
-    recentFp.add(fp);
-    acceptedCount++;
-    acceptedTracks.push({ name: l.track, artist: l.artist });
+  if (!db) {
+    // No Firestore connection — nothing to safely transact against. Bail out
+    // rather than risk a non-atomic write against a database that isn't even
+    // configured (this also means: if you're seeing "Local file" storage in
+    // the server logs, none of this — or any other backend HP logic — is
+    // actually reaching your shared database yet).
+    return { success: false, status: 'Database not connected — HP cannot be safely awarded right now' };
   }
-  const recentFpArr = Array.from(recentFp).slice(-500); // bounded safety-net, not the primary dedup mechanism
 
-  // Persistent verified counters — HP entitlement is recomputed from the
-  // running verified-stream total each time, and only the DELTA since the
-  // last award is granted. This replaces the old "floor(total/10) re-added
-  // every sync" pattern that could hand out the same HP repeatedly.
-  const hpBefore = syncDoc.lb.streamingHpAwarded || 0;
-  const newVerifiedTotal = (syncDoc.lb.verifiedBtsStreams || 0) + acceptedCount;
-  const newEntitlement = Math.floor(newVerifiedTotal / 10);
-  const earned = Math.max(0, newEntitlement - hpBefore);
+  // Transaction: two devices syncing the SAME member at the same instant must
+  // not both compute HP from the same starting point and award it twice. The
+  // transaction re-reads both docs at commit time and Firestore automatically
+  // retries this function if a conflicting write happened in between.
+  const syncRef = db.collection('syncData').doc(memberUid);
+  const memberRef = db.collection('members').doc(memberUid);
+  let out = null;
 
-  syncDoc.lb.verifiedBtsStreams = newVerifiedTotal;
-  syncDoc.lb.streamingHpAwarded = newEntitlement;
-  syncDoc.lb.lastProcessedTimestamp = maxTs;
-  syncDoc.lb.recentFingerprints = recentFpArr;
-  syncDoc.lb.lastSync = new Date().toISOString();
-  syncDoc.lb.lastNewStreams = acceptedCount;
-  syncDoc.lb.status = earned > 0 ? 'HP added' : acceptedCount > 0 ? 'Synced' : 'No new streams';
-  await dbSaveSyncData(memberUid, syncDoc);
+  try {
+    await db.runTransaction(async (tx) => {
+      const syncSnap = await tx.get(syncRef);
+      const memberSnap = await tx.get(memberRef);
+      const syncDoc = syncSnap.exists ? syncSnap.data() : {};
+      syncDoc.lb = syncDoc.lb || {};
+      const member = memberSnap.exists ? memberSnap.data() : {};
 
-  // Update member HP + streams — keyed by uid (see note above). Totals are
-  // set to absolute values (never re-added as a delta on top of a delta),
-  // and never allowed to decrease.
-  const member = await dbGetMember(memberUid) || {};
-  const oldTotalHp   = member.totalHp || 0;
-  const oldTotalStr  = Math.max(member.totalStreams || 0, member.lifetimeStreams || 0);
-  const oldWeeklyStr = member.streams || 0;
-  const oldWeeklyHp  = member.hp || 0;
-  const newWeeklyStr = oldWeeklyStr + acceptedCount;
-  const newTotalStr  = Math.max(oldTotalStr + acceptedCount, newWeeklyStr);
-  const newWeeklyHp  = oldWeeklyHp + earned;
-  const newTotalHp   = Math.max(oldTotalHp + earned, newWeeklyHp);
+      // Only process listens strictly after the CURRENT (transaction-fresh)
+      // watermark — if a concurrent sync already advanced it, skip whatever
+      // it already handled instead of double-counting.
+      const freshWatermark = syncDoc.lb.lastProcessedTimestamp || nowSec;
+      const recentFp = new Set(syncDoc.lb.recentFingerprints || []);
+      let acceptedCount = 0, rejectedCount = 0, duplicateCount = 0;
+      const acceptedTracks = [];
+      let maxTs = freshWatermark;
 
-  const updates = {
-    streams: newWeeklyStr, weeklyStreams: newWeeklyStr,
-    totalStreams: newTotalStr, lifetimeStreams: newTotalStr,
-    lastSyncStreams: acceptedCount, streamsCountedThisSync: acceptedCount,
-  };
-  if (earned > 0) {
-    updates.hp = newWeeklyHp; updates.weeklyHp = newWeeklyHp;
-    updates.totalHp = newTotalHp; updates.hpStreaming = (member.hpStreaming || 0) + earned;
+      for (const l of listens) {
+        if (l.playedAt <= freshWatermark) continue; // already processed by a concurrent sync
+        maxTs = Math.max(maxTs, l.playedAt);
+        if (!isApprovedBtsArtist(l.artist)) { rejectedCount++; continue; }
+        const fp = _streamFingerprint(memberUid, 'listenbrainz', l.artist, l.track, l.playedAt);
+        if (recentFp.has(fp)) { duplicateCount++; continue; }
+        recentFp.add(fp);
+        acceptedCount++;
+        acceptedTracks.push({ name: l.track, artist: l.artist });
+      }
+      const recentFpArr = Array.from(recentFp).slice(-500);
+
+      // Persistent verified counters — HP entitlement is recomputed from the
+      // running verified-stream total, and only the DELTA since the last
+      // award is granted (never floor(total/10) re-added every sync).
+      const hpBefore = syncDoc.lb.streamingHpAwarded || 0;
+      const newVerifiedTotal = (syncDoc.lb.verifiedBtsStreams || 0) + acceptedCount;
+      const newEntitlement = Math.floor(newVerifiedTotal / 10);
+      const earned = Math.max(0, newEntitlement - hpBefore);
+
+      syncDoc.lb.verifiedBtsStreams = newVerifiedTotal;
+      syncDoc.lb.streamingHpAwarded = newEntitlement;
+      syncDoc.lb.lastProcessedTimestamp = maxTs;
+      syncDoc.lb.recentFingerprints = recentFpArr;
+      syncDoc.lb.lastSync = new Date().toISOString();
+      syncDoc.lb.lastNewStreams = acceptedCount;
+      syncDoc.lb.username = lbUsername;
+      syncDoc.lb.status = earned > 0 ? 'HP added' : acceptedCount > 0 ? 'Synced' : 'No new streams';
+
+      // Absolute values — never allowed to decrease.
+      const oldTotalHp   = member.totalHp || 0;
+      const oldTotalStr  = Math.max(member.totalStreams || 0, member.lifetimeStreams || 0);
+      const oldWeeklyStr = member.streams || 0;
+      const oldWeeklyHp  = member.hp || 0;
+      const newWeeklyStr = oldWeeklyStr + acceptedCount;
+      const newTotalStr  = Math.max(oldTotalStr + acceptedCount, newWeeklyStr);
+      const newWeeklyHp  = oldWeeklyHp + earned;
+      const newTotalHp   = Math.max(oldTotalHp + earned, newWeeklyHp);
+      const newHpStreaming = (member.hpStreaming || 0) + earned;
+
+      const memberUpdates = {
+        streams: newWeeklyStr, weeklyStreams: newWeeklyStr,
+        totalStreams: newTotalStr, lifetimeStreams: newTotalStr,
+        lastSyncStreams: acceptedCount, streamsCountedThisSync: acceptedCount,
+        lastUpdated: new Date().toISOString(), username,
+      };
+      if (earned > 0) {
+        memberUpdates.hp = newWeeklyHp; memberUpdates.weeklyHp = newWeeklyHp;
+        memberUpdates.totalHp = newTotalHp; memberUpdates.hpStreaming = newHpStreaming;
+      }
+
+      tx.set(syncRef, { ...syncDoc, username: memberUid }, { merge: true });
+      if (acceptedCount > 0 || earned > 0) {
+        tx.set(memberRef, memberUpdates, { merge: true });
+      }
+
+      out = {
+        acceptedCount, rejectedCount, duplicateCount, earned,
+        oldTotalHp, newTotalHp, newWeeklyHp, newTotalStr, newWeeklyStr, newHpStreaming,
+        pending: newVerifiedTotal % 10, acceptedTracks, status: syncDoc.lb.status,
+      };
+    });
+  } catch (e) {
+    return { success: false, status: 'Sync failed — please try again' };
   }
-  if (acceptedCount > 0 || earned > 0) {
-    await dbSaveMember(memberUid, updates);
-    await dbAddNotification('stream', `${username}: +${acceptedCount} verified BTS streams → +${earned} HP`, { memberUid, username, lbUsername, earned, newStreams: acceptedCount, team: memberTeam });
+
+  if (out.acceptedCount > 0 || out.earned > 0) {
+    await dbAddNotification('stream', `${username}: +${out.acceptedCount} verified BTS streams → +${out.earned} HP`, { memberUid, username, lbUsername, earned: out.earned, newStreams: out.acceptedCount, team: memberTeam });
   }
 
   // Audit log — every sync call, so incorrect HP changes can be traced
   // instead of silently modifying member totals.
   if (db) db.collection('streamingHpAudit').add({
     memberUid, username, source: 'listenbrainz',
-    newVerifiedStreams: acceptedCount, rejectedStreams: rejectedCount, duplicatesIgnored: duplicateCount,
-    hpBefore: oldTotalHp, hpAwarded: earned, hpAfter: earned > 0 ? newTotalHp : oldTotalHp,
+    newVerifiedStreams: out.acceptedCount, rejectedStreams: out.rejectedCount, duplicatesIgnored: out.duplicateCount,
+    hpBefore: out.oldTotalHp, hpAwarded: out.earned, hpAfter: out.earned > 0 ? out.newTotalHp : out.oldTotalHp,
     timestamp: new Date().toISOString(),
   }).catch(()=>{});
 
   return {
-    success: true, firstSync: false, status: syncDoc.lb.status, username: lbUsername,
-    newStreams: acceptedCount, earnedHP: earned, pending: newVerifiedTotal % 10,
-    newTracksList: acceptedTracks,
-    newTotalHp, newWeeklyHp: newWeeklyHp, newTotalStreams: newTotalStr, newWeeklyStreams: newWeeklyStr, newHpStreaming: (member.hpStreaming || 0) + earned,
+    success: true, firstSync: false, status: out.status, username: lbUsername,
+    newStreams: out.acceptedCount, earnedHP: out.earned, pending: out.pending,
+    newTracksList: out.acceptedTracks,
+    newTotalHp: out.newTotalHp, newWeeklyHp: out.newWeeklyHp, newTotalStreams: out.newTotalStr, newWeeklyStreams: out.newWeeklyStr, newHpStreaming: out.newHpStreaming,
   };
 }
 
