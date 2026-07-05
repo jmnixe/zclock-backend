@@ -843,6 +843,18 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, { code: 200, message: 'Token valid.', valid: true, user_name: member.username });
   }
 
+  /* ── ListenBrainz-compatible listen history (read-back) ──
+     Pano Scrobbler's own "Scrobbles" tab calls this to display your
+     history back to you — a DIFFERENT feature from actually counting
+     streams (that's /1/submit-listens, above, and works independently
+     of this). We don't keep a full per-listen log (only dedup
+     fingerprints), so this returns a correctly-shaped but currently
+     empty response — enough to stop the "not supported" error, but
+     Pano Scrobbler's history view won't show real playback history. */
+  if (pathname.match(/^\/1\/user\/[^/]+\/listens$/) && method === 'GET') {
+    return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
+  }
+
   /* ── ListenBrainz-compatible submission endpoint ──
      Pano Scrobbler (or any ListenBrainz-compatible scrobbler) can be
      pointed at this server as a custom "ListenBrainz-like instance",
