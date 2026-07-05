@@ -726,6 +726,25 @@ const server = http.createServer(async (req, res) => {
     } catch(e) { return sendJSON(res, 200, { success: false, error: e.message }); }
   }
 
+  /* ── Admin: delete a member's actual login (Firebase Auth account) ──
+     Deleting the Firestore profile alone does NOT free up their email/
+     username to sign up again — the login credential itself lives in
+     Firebase Authentication, which only the Admin SDK can delete on
+     someone else's behalf (the client SDK can only delete your OWN
+     currently-signed-in account). This is that missing piece. */
+  if (pathname.startsWith('/api/admin/delete-auth-user/') && method === 'DELETE') {
+    const targetUid = decodeURIComponent(pathname.replace('/api/admin/delete-auth-user/', ''));
+    if (!firebaseReady) return sendJSON(res, 200, { success: false, error: 'Firebase not connected on the backend — delete the login manually in Firebase Console → Authentication instead.' });
+    try {
+      const admin = require('firebase-admin');
+      await admin.auth().deleteUser(targetUid);
+      return sendJSON(res, 200, { success: true });
+    } catch (e) {
+      if (e.code === 'auth/user-not-found') return sendJSON(res, 200, { success: true, note: 'Login was already gone' });
+      return sendJSON(res, 200, { success: false, error: e.message });
+    }
+  }
+
   if (pathname === '/api/register' && method === 'POST') {
     try {
       const body = await readBody(req);
