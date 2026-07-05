@@ -613,30 +613,6 @@ async function syncLastFm(memberUid, profileUrl, memberTeam) {
   };
 }
 
-/* ═══════════════════════════════════════════════════════════
-   LISTENBRAINZ SYNC — uses ListenBrainz public API
-   No API key required for public listen counts.
-   ═══════════════════════════════════════════════════════════ */
-async function syncStatsFm(memberId, profileUrl) {
-  const username = (profileUrl.match(/stats\.fm\/user\/([^/?#\s]+)/i)||[])[1] || profileUrl.trim();
-  if (!profileUrl.trim()) return { success: false, status: 'Invalid profile URL' };
-  let syncDoc = await dbGetSyncData(memberId) || {};
-  syncDoc.statsfm = { profileUrl, username, status: 'Connected', lastSync: new Date().toISOString() };
-  await dbSaveSyncData(memberId, syncDoc);
-  await dbAddNotification('sync', `${memberId} connected Stats.fm profile`, { memberId });
-  return { success: true, status: 'Connected', username };
-}
-
-async function syncMusicat(memberId, profileUrl) {
-  const username = (profileUrl.match(/musicat[^\/]*\/[a-z0-9-]*\/([^/?#\s]+)/i)||[])[1] || profileUrl.trim();
-  if (!profileUrl.trim()) return { success: false, status: 'Invalid profile URL' };
-  let syncDoc = await dbGetSyncData(memberId) || {};
-  syncDoc.musicat = { profileUrl, username, status: 'Connected', lastSync: new Date().toISOString() };
-  await dbSaveSyncData(memberId, syncDoc);
-  await dbAddNotification('sync', `${memberId} connected Musicat profile`, { memberId });
-  return { success: true, status: 'Connected', username };
-}
-
 /* ════════════════════════════════════════════════════════════
    MEMBER REGISTRATION — called when a new user joins
    ════════════════════════════════════════════════════════════ */
@@ -819,26 +795,6 @@ const server = http.createServer(async (req, res) => {
     } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
   }
 
-  /* ── SYNC STATS.FM ── */
-  if (pathname === '/api/sync-statsfm' && method === 'POST') {
-    try {
-      const { memberId, profileUrl } = await readBody(req);
-      if (!memberId) return sendJSON(res, 400, { success: false });
-      const result = await syncStatsFm(memberId, profileUrl || '');
-      return sendJSON(res, 200, result);
-    } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
-  }
-
-  /* ── SYNC MUSICAT ── */
-  if (pathname === '/api/sync-musicat' && method === 'POST') {
-    try {
-      const { memberId, profileUrl } = await readBody(req);
-      if (!memberId) return sendJSON(res, 400, { success: false });
-      const result = await syncMusicat(memberId, profileUrl || '');
-      return sendJSON(res, 200, result);
-    } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
-  }
-
   /* ── SYNC ALL (Last.fm only — ListenBrainz and Webhook are push-based now,
      see /1/submit-listens and /api/webhook/scrobble below; no polling needed) ── */
   if (pathname.startsWith('/api/sync-all/') && method === 'POST') {
@@ -927,12 +883,10 @@ const server = http.createServer(async (req, res) => {
   /* ── SAVE PROFILES ── */
   if (pathname === '/api/save-profiles' && method === 'POST') {
     try {
-      const { memberId, lastfmUrl, statsfmUrl, musicatUrl, memberTeam } = await readBody(req);
+      const { memberId, lastfmUrl, memberTeam } = await readBody(req);
       if (!memberId) return sendJSON(res, 400, { success: false });
       const results = {};
-      if (lastfmUrl  !== undefined) results.lastfm  = await syncLastFm(memberId, lastfmUrl, memberTeam || '').catch(() => ({ success: false, status: 'Sync temporarily unavailable' }));
-      if (statsfmUrl !== undefined) results.statsfm = await syncStatsFm(memberId, statsfmUrl).catch(() => ({ success: false, status: 'Sync temporarily unavailable' }));
-      if (musicatUrl !== undefined) results.musicat = await syncMusicat(memberId, musicatUrl).catch(() => ({ success: false, status: 'Sync temporarily unavailable' }));
+      if (lastfmUrl !== undefined) results.lastfm = await syncLastFm(memberId, lastfmUrl, memberTeam || '').catch(() => ({ success: false, status: 'Sync temporarily unavailable' }));
       return sendJSON(res, 200, { success: true, platforms: results, totalEarnedHP: results.lastfm?.earnedHP || 0 });
     } catch (e) { return sendJSON(res, 200, { success: false }); }
   }
