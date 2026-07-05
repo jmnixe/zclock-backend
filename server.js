@@ -619,6 +619,16 @@ async function syncListenBrainz(memberUid, username, lbUsername, memberTeam) {
     hpBefore: out.oldTotalHp, hpAwarded: out.earned, hpAfter: out.earned > 0 ? out.newTotalHp : out.oldTotalHp,
     timestamp: new Date().toISOString(),
   }).catch(()=>{});
+  // hpTransactions ledger — this is what the Dashboard's HP Earned
+  // breakdown actually reads from, so streaming HP must land here too.
+  if (db && out.earned > 0) {
+    const txnId = 'hpt_' + Date.now() + '_' + Math.floor(Math.random()*10000);
+    db.collection('hpTransactions').doc(txnId).set({
+      transactionId: txnId, memberUid, username, team: memberTeam || '',
+      source: 'streaming', amount: out.earned, reason: `ListenBrainz: ${out.acceptedCount} verified streams`,
+      relatedId: null, createdAt: new Date().toISOString(), createdBy: 'system',
+    }).catch(()=>{});
+  }
 
   return {
     success: true, firstSync: false, status: out.status, username: lbUsername,
@@ -780,6 +790,14 @@ async function syncSpotify(memberUid, username, memberTeam) {
     hpBefore: out.oldTotalHp, hpAwarded: out.earned, hpAfter: out.earned > 0 ? out.newTotalHp : out.oldTotalHp,
     timestamp: new Date().toISOString(),
   }).catch(()=>{});
+  if (db && out.earned > 0) {
+    const txnId = 'hpt_' + Date.now() + '_' + Math.floor(Math.random()*10000);
+    db.collection('hpTransactions').doc(txnId).set({
+      transactionId: txnId, memberUid, username, team: memberTeam || '',
+      source: 'streaming', amount: out.earned, reason: `Spotify: ${out.acceptedCount} verified streams`,
+      relatedId: null, createdAt: new Date().toISOString(), createdBy: 'system',
+    }).catch(()=>{});
+  }
 
   return {
     success: true, firstSync: false, status: out.status,
