@@ -829,6 +829,20 @@ const server = http.createServer(async (req, res) => {
     } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
   }
 
+  /* ── ListenBrainz-compatible token validation ──
+     Pano Scrobbler's "Verify" button calls this BEFORE letting the
+     member save the instance config — matches the real ListenBrainz
+     API's /1/validate-token contract exactly, so Pano Scrobbler
+     recognizes the response. Without this, Verify always 404s even
+     with a correct URL and a real token. */
+  if (pathname === '/1/validate-token' && method === 'GET') {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.replace(/^Token\s+/i, '').trim();
+    const member = await _findMemberByPin(token);
+    if (!member) return sendJSON(res, 200, { code: 200, message: 'Token invalid.', valid: false });
+    return sendJSON(res, 200, { code: 200, message: 'Token valid.', valid: true, user_name: member.username });
+  }
+
   /* ── ListenBrainz-compatible submission endpoint ──
      Pano Scrobbler (or any ListenBrainz-compatible scrobbler) can be
      pointed at this server as a custom "ListenBrainz-like instance",
