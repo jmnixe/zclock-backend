@@ -34,6 +34,14 @@ const PORT               = process.env.PORT || 3001;
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'fir-project-id-b56fc';
 const FIREBASE_CREDENTIALS  = process.env.GOOGLE_APPLICATION_CREDENTIALS || path.join(__dirname, 'firebase-credentials.json');
 
+/* ── Spotify OAuth (real automatic sync — unlike Stats.fm/Musicat, Spotify's
+   Web API is genuinely public and documented) ──
+   Requires the site owner to register a free app at
+   https://developer.spotify.com/dashboard and set these three env vars. */
+const SPOTIFY_CLIENT_ID     = process.env.SPOTIFY_CLIENT_ID || '';
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || '';
+const SPOTIFY_REDIRECT_URI  = process.env.SPOTIFY_REDIRECT_URI || '';
+
 /* ════════════════════════════════════════════════════════════
    FIREBASE ADAPTER
    Wraps firebase-admin OR falls back to local JSON storage.
@@ -266,6 +274,30 @@ function fetchJSON(apiUrl) {
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.end();
+  });
+}
+
+/* Generic HTTP request supporting POST + custom headers + body — needed for
+   OAuth token exchanges (Spotify), which fetchJSON (GET-only) can't do. */
+function httpRequest(reqUrl, { method = 'GET', headers = {}, body = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new url.URL(reqUrl);
+    const req = https.request({
+      hostname: parsed.hostname, path: parsed.pathname + parsed.search, method,
+      headers: { 'User-Agent': 'Zclock/1.0', Accept: 'application/json', ...headers },
+      timeout: 10000,
+    }, res => {
+      let respBody = '';
+      res.on('data', c => respBody += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(respBody) }); }
+        catch (e) { resolve({ status: res.statusCode, data: null, raw: respBody }); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    if (body) req.write(body);
     req.end();
   });
 }
@@ -596,6 +628,167 @@ async function syncListenBrainz(memberUid, username, lbUsername, memberTeam) {
   };
 }
 
+/* ════════════════════════════════════════════════════════════
+   SPOTIFY — real automatic sync via Spotify's own public Web API
+   (unlike Stats.fm/Musicat, which have no independent per-user
+   API of their own — they're both just Spotify/Apple Music
+   wrappers). Uses the exact same verified-artist / fingerprint /
+   transaction pipeline as syncListenBrainz.
+   ════════════════════════════════════════════════════════════ */
+async function _spotifyRefreshAccessToken(refreshToken) {
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) throw new Error('Spotify not configured on the backend');
+  const basic = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+  const body = `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`;
+  const r = await httpRequest('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
+    body,
+  });
+  if (r.status !== 200 || !r.data || !r.data.access_token) throw new Error('Spotify token refresh failed');
+  return r.data.access_token;
+}
+
+async function fetchSpotifyRecentlyPlayed(accessToken, afterMs) {
+  const url2 = `https://api.spotify.com/v1/me/player/recently-played?limit=50${afterMs ? '&after=' + afterMs : ''}`;
+  const r = await httpRequest(url2, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+  if (r.status !== 200 || !r.data || !r.data.items) return [];
+  return r.data.items.map(it => ({
+    artist: (it.track && it.track.artists && it.track.artists.map(a => a.name).join(', ')) || '',
+    track: (it.track && it.track.name) || '',
+    playedAt: it.played_at ? Math.floor(new Date(it.played_at).getTime() / 1000) : 0,
+  })).filter(l => l.track && l.playedAt);
+}
+
+async function syncSpotify(memberUid, username, memberTeam) {
+  if (!memberUid) return { success: false, status: 'Missing member ID' };
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) return { success: false, status: 'Spotify not configured on the backend yet' };
+
+  let syncDoc = await dbGetSyncData(memberUid) || {};
+  syncDoc.spotify = syncDoc.spotify || {};
+  if (!syncDoc.spotify.refreshToken) return { success: false, status: 'Spotify not connected' };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!syncDoc.spotify.firstSyncDone) {
+    syncDoc.spotify.lastProcessedTimestamp = nowSec;
+    syncDoc.spotify.verifiedBtsStreams = 0;
+    syncDoc.spotify.streamingHpAwarded = 0;
+    syncDoc.spotify.recentFingerprints = [];
+    syncDoc.spotify.firstSyncDone = true;
+    syncDoc.spotify.lastSync = new Date().toISOString();
+    syncDoc.spotify.status = 'Connected';
+    await dbSaveSyncData(memberUid, syncDoc);
+    if (db) db.collection('streamingHpAudit').add({
+      memberUid, username, source: 'spotify', newVerifiedStreams: 0, rejectedStreams: 0, duplicatesIgnored: 0,
+      hpBefore: 0, hpAwarded: 0, hpAfter: 0, timestamp: new Date().toISOString(), note: 'First connection — baseline set, no historical import',
+    }).catch(()=>{});
+    return { success: true, firstSync: true, status: 'Connected', earnedHP: 0, newStreams: 0, pending: 0, newTracksList: [] };
+  }
+
+  let listens;
+  try {
+    const accessToken = await _spotifyRefreshAccessToken(syncDoc.spotify.refreshToken);
+    listens = await fetchSpotifyRecentlyPlayed(accessToken, (syncDoc.spotify.lastProcessedTimestamp || nowSec) * 1000);
+  } catch (e) {
+    return { success: false, status: 'Spotify sync failed: ' + e.message };
+  }
+  listens.sort((a, b) => a.playedAt - b.playedAt);
+
+  if (!db) return { success: false, status: 'Database not connected — HP cannot be safely awarded right now' };
+  const syncRef = db.collection('syncData').doc(memberUid);
+  const memberRef = db.collection('members').doc(memberUid);
+  let out = null;
+
+  try {
+    await db.runTransaction(async (tx) => {
+      const syncSnap = await tx.get(syncRef);
+      const memberSnap = await tx.get(memberRef);
+      const sDoc = syncSnap.exists ? syncSnap.data() : {};
+      sDoc.spotify = sDoc.spotify || {};
+      const member = memberSnap.exists ? memberSnap.data() : {};
+
+      const freshWatermark = sDoc.spotify.lastProcessedTimestamp || nowSec;
+      const recentFp = new Set(sDoc.spotify.recentFingerprints || []);
+      let acceptedCount = 0, rejectedCount = 0, duplicateCount = 0;
+      const acceptedTracks = [];
+      let maxTs = freshWatermark;
+
+      for (const l of listens) {
+        if (l.playedAt <= freshWatermark) continue;
+        maxTs = Math.max(maxTs, l.playedAt);
+        if (!isApprovedBtsArtist(l.artist)) { rejectedCount++; continue; }
+        const fp = _streamFingerprint(memberUid, 'spotify', l.artist, l.track, l.playedAt);
+        if (recentFp.has(fp)) { duplicateCount++; continue; }
+        recentFp.add(fp);
+        acceptedCount++;
+        acceptedTracks.push({ name: l.track, artist: l.artist });
+      }
+      const recentFpArr = Array.from(recentFp).slice(-500);
+
+      const hpBefore = sDoc.spotify.streamingHpAwarded || 0;
+      const newVerifiedTotal = (sDoc.spotify.verifiedBtsStreams || 0) + acceptedCount;
+      const newEntitlement = Math.floor(newVerifiedTotal / 10);
+      const earned = Math.max(0, newEntitlement - hpBefore);
+
+      sDoc.spotify.verifiedBtsStreams = newVerifiedTotal;
+      sDoc.spotify.streamingHpAwarded = newEntitlement;
+      sDoc.spotify.lastProcessedTimestamp = maxTs;
+      sDoc.spotify.recentFingerprints = recentFpArr;
+      sDoc.spotify.lastSync = new Date().toISOString();
+      sDoc.spotify.lastNewStreams = acceptedCount;
+      sDoc.spotify.status = earned > 0 ? 'HP added' : acceptedCount > 0 ? 'Synced' : 'No new streams';
+
+      const oldTotalHp   = member.totalHp || 0;
+      const oldTotalStr  = Math.max(member.totalStreams || 0, member.lifetimeStreams || 0);
+      const oldWeeklyStr = member.streams || 0;
+      const oldWeeklyHp  = member.hp || 0;
+      const newWeeklyStr = oldWeeklyStr + acceptedCount;
+      const newTotalStr  = Math.max(oldTotalStr + acceptedCount, newWeeklyStr);
+      const newWeeklyHp  = oldWeeklyHp + earned;
+      const newTotalHp   = Math.max(oldTotalHp + earned, newWeeklyHp);
+      const newHpStreaming = (member.hpStreaming || 0) + earned;
+
+      const memberUpdates = {
+        streams: newWeeklyStr, weeklyStreams: newWeeklyStr,
+        totalStreams: newTotalStr, lifetimeStreams: newTotalStr,
+        lastSyncStreams: acceptedCount, streamsCountedThisSync: acceptedCount,
+        lastUpdated: new Date().toISOString(),
+      };
+      if (earned > 0) {
+        memberUpdates.hp = newWeeklyHp; memberUpdates.weeklyHp = newWeeklyHp;
+        memberUpdates.totalHp = newTotalHp; memberUpdates.hpStreaming = newHpStreaming;
+      }
+
+      tx.set(syncRef, { ...sDoc, username: memberUid }, { merge: true });
+      if (acceptedCount > 0 || earned > 0) tx.set(memberRef, memberUpdates, { merge: true });
+
+      out = {
+        acceptedCount, rejectedCount, duplicateCount, earned,
+        oldTotalHp, newTotalHp, newWeeklyHp, newTotalStr, newWeeklyStr, newHpStreaming,
+        pending: newVerifiedTotal % 10, acceptedTracks, status: sDoc.spotify.status,
+      };
+    });
+  } catch (e) {
+    return { success: false, status: 'Sync failed — please try again' };
+  }
+
+  if (out.acceptedCount > 0 || out.earned > 0) {
+    await dbAddNotification('stream', `${username}: +${out.acceptedCount} verified BTS streams (Spotify) → +${out.earned} HP`, { memberUid, username, earned: out.earned, newStreams: out.acceptedCount, team: memberTeam });
+  }
+  if (db) db.collection('streamingHpAudit').add({
+    memberUid, username, source: 'spotify',
+    newVerifiedStreams: out.acceptedCount, rejectedStreams: out.rejectedCount, duplicatesIgnored: out.duplicateCount,
+    hpBefore: out.oldTotalHp, hpAwarded: out.earned, hpAfter: out.earned > 0 ? out.newTotalHp : out.oldTotalHp,
+    timestamp: new Date().toISOString(),
+  }).catch(()=>{});
+
+  return {
+    success: true, firstSync: false, status: out.status,
+    newStreams: out.acceptedCount, earnedHP: out.earned, pending: out.pending,
+    newTracksList: out.acceptedTracks,
+    newTotalHp: out.newTotalHp, newWeeklyHp: out.newWeeklyHp, newTotalStreams: out.newTotalStr, newWeeklyStreams: out.newWeeklyStr, newHpStreaming: out.newHpStreaming,
+  };
+}
+
 async function syncStatsFm(memberId, profileUrl) {
   const username = (profileUrl.match(/stats\.fm\/user\/([^/?#\s]+)/i)||[])[1] || profileUrl.trim();
   if (!profileUrl.trim()) return { success: false, status: 'Invalid profile URL' };
@@ -667,6 +860,53 @@ const server = http.createServer(async (req, res) => {
   /* Health */
   if (pathname === '/api/health') {
     return sendJSON(res, 200, { status: 'ok', firebase: firebaseReady, time: new Date().toISOString() });
+  }
+
+  /* ── Spotify OAuth: step 1 — build the URL the frontend redirects to ── */
+  if (pathname === '/api/spotify/auth-url' && method === 'GET') {
+    if (!SPOTIFY_CLIENT_ID || !SPOTIFY_REDIRECT_URI) {
+      return sendJSON(res, 200, { success: false, error: 'Spotify is not configured on the backend yet. Set SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, and SPOTIFY_REDIRECT_URI.' });
+    }
+    const memberUid = parsed.query.memberUid || '';
+    if (!memberUid) return sendJSON(res, 200, { success: false, error: 'Missing member ID' });
+    const params = new url.URLSearchParams({
+      client_id: SPOTIFY_CLIENT_ID,
+      response_type: 'code',
+      redirect_uri: SPOTIFY_REDIRECT_URI,
+      scope: 'user-read-recently-played',
+      state: memberUid,
+    });
+    return sendJSON(res, 200, { success: true, url: `https://accounts.spotify.com/authorize?${params.toString()}` });
+  }
+
+  /* ── Spotify OAuth: step 2 — Spotify redirects the user's browser here ── */
+  if (pathname === '/api/spotify/callback' && method === 'GET') {
+    const code = parsed.query.code;
+    const memberUid = parsed.query.state;
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://zer0clock.netlify.app';
+    if (!code || !memberUid) {
+      res.writeHead(302, { Location: `${FRONTEND_URL}/?spotify=error` }); return res.end();
+    }
+    try {
+      const basic = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+      const body = `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(SPOTIFY_REDIRECT_URI)}`;
+      const r = await httpRequest('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: { 'Authorization': `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
+        body,
+      });
+      if (r.status !== 200 || !r.data || !r.data.refresh_token) {
+        res.writeHead(302, { Location: `${FRONTEND_URL}/?spotify=error` }); return res.end();
+      }
+      const syncDoc = await dbGetSyncData(memberUid) || {};
+      syncDoc.spotify = { ...(syncDoc.spotify||{}), refreshToken: r.data.refresh_token, connectedAt: new Date().toISOString() };
+      await dbSaveSyncData(memberUid, syncDoc);
+      // Mark connected on the member doc too, so Dashboard/Profile/Admin all see it immediately
+      if (db) await db.collection('members').doc(memberUid).update({ spotify: { connected: true, connectedAt: new Date().toISOString() } }).catch(()=>{});
+      res.writeHead(302, { Location: `${FRONTEND_URL}/?spotify=connected` }); return res.end();
+    } catch (e) {
+      res.writeHead(302, { Location: `${FRONTEND_URL}/?spotify=error` }); return res.end();
+    }
   }
 
   /* ── MEMBER REGISTRATION ── */
@@ -826,31 +1066,47 @@ const server = http.createServer(async (req, res) => {
       const lastfmUrl  = body.lastfmUrl  || '';
       const memberTeam = body.memberTeam || '';
       const memberUid  = body.memberUid || '';
-      let lfResult;
+      const wantsSpotify = !!body.spotifyConnected;
+      let lfResult = null, spotifyResult = null;
+
       if (lbUsername) {
         if (!memberUid) return sendJSON(res, 200, { success: false, status: 'Missing member ID — please refresh and try again' });
         lfResult = await syncListenBrainz(memberUid, memberId, lbUsername, memberTeam);
-      } else if (lastfmUrl) {
-        lfResult = await syncLastFm(memberUid || memberId, lastfmUrl, memberTeam);
-      } else {
-        // Try from saved syncDoc
-        const syncDoc = await dbGetSyncData(memberUid || memberId);
-        if (syncDoc?.lastfm?.profileUrl) {
-          lfResult = await syncLastFm(memberUid || memberId, syncDoc.lastfm.profileUrl, memberTeam);
+      }
+      if (wantsSpotify && memberUid) {
+        // Runs AFTER ListenBrainz (if both connected) so its transaction reads
+        // the freshest member state — the absolute totals it returns already
+        // include both awards, never double-counted.
+        spotifyResult = await syncSpotify(memberUid, memberId, memberTeam);
+      }
+      if (!lfResult && !spotifyResult) {
+        if (lastfmUrl) {
+          lfResult = await syncLastFm(memberUid || memberId, lastfmUrl, memberTeam);
         } else {
-          return sendJSON(res, 200, { success: false, status: 'No streaming platform connected' });
+          const syncDoc = await dbGetSyncData(memberUid || memberId);
+          if (syncDoc?.lastfm?.profileUrl) {
+            lfResult = await syncLastFm(memberUid || memberId, syncDoc.lastfm.profileUrl, memberTeam);
+          } else {
+            return sendJSON(res, 200, { success: false, status: 'No streaming platform connected' });
+          }
         }
       }
+
+      const final = spotifyResult || lfResult; // whichever ran last reflects the cumulative absolute totals
+      const combinedEarned = (lfResult?.earnedHP||0) + (spotifyResult?.earnedHP||0);
+      const combinedStreams = (lfResult?.newStreams||0) + (spotifyResult?.newStreams||0);
+      const combinedTracks = [...(lfResult?.newTracksList||[]), ...(spotifyResult?.newTracksList||[])];
+
       return sendJSON(res, 200, {
-        success: true, lastfm: lfResult,
-        totalEarnedHP: lfResult?.earnedHP || 0,
-        newStreams:     lfResult?.newStreams || 0,
-        firstSync:     lfResult?.firstSync || false,
-        pending:       lfResult?.pending || 0,
-        newTracksList: lfResult?.newTracksList || [],
-        newTotalHp: lfResult?.newTotalHp, newWeeklyHp: lfResult?.newWeeklyHp,
-        newTotalStreams: lfResult?.newTotalStreams, newWeeklyStreams: lfResult?.newWeeklyStreams,
-        newHpStreaming: lfResult?.newHpStreaming,
+        success: true, lastfm: lfResult, spotify: spotifyResult,
+        totalEarnedHP: combinedEarned,
+        newStreams:     combinedStreams,
+        firstSync:     lfResult?.firstSync || spotifyResult?.firstSync || false,
+        pending:       final?.pending || 0,
+        newTracksList: combinedTracks,
+        newTotalHp: final?.newTotalHp, newWeeklyHp: final?.newWeeklyHp,
+        newTotalStreams: final?.newTotalStreams, newWeeklyStreams: final?.newWeeklyStreams,
+        newHpStreaming: final?.newHpStreaming,
       });
     } catch (e) { return sendJSON(res, 200, { success: false, status: 'Sync temporarily unavailable' }); }
   }
