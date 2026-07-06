@@ -381,7 +381,7 @@ async function _processScrobbleBatch(memberUid, username, memberTeam, source, sc
         if (recentFp.has(fp)) { duplicateCount++; continue; }
         recentFp.add(fp);
         acceptedCount++;
-        acceptedTracks.push({ name: l.track, artist: l.artist });
+        acceptedTracks.push({ name: l.track, artist: l.artist, album: l.album || '', playedAt: l.playedAt });
       }
       const recentFpArr = Array.from(recentFp).slice(-500);
 
@@ -445,6 +445,23 @@ async function _processScrobbleBatch(memberUid, username, memberTeam, source, sc
     }).catch(()=>{});
   }
 
+  // Real listen log — this is what powers /1/user/{username}/listens, so
+  // Pano Scrobbler's own history/charts views can show something real
+  // instead of an empty list. Purely for display; dedup/HP already happened
+  // above using the fingerprint set, independent of this.
+  if (out.acceptedTracks && out.acceptedTracks.length) {
+    const batch = db.batch();
+    for (const t of out.acceptedTracks) {
+      const logId = `${memberUid}_${source}_${t.playedAt}_${Math.floor(Math.random()*10000)}`;
+      batch.set(db.collection('listensLog').doc(logId), {
+        memberUid, username, source,
+        artist: t.artist, track: t.name, album: t.album || '',
+        listened_at: t.playedAt, createdAt: new Date().toISOString(),
+      });
+    }
+    await batch.commit().catch(()=>{});
+  }
+
   return out;
 }
 
@@ -458,6 +475,7 @@ async function fetchLastFmRecentTracks(username, fromUnixSec) {
     .map(t => ({
       artist: (t.artist && (t.artist['#text'] || t.artist)) || '',
       track: (t.name || '').trim(),
+      album: (t.album && (t.album['#text'] || t.album)) || '',
       playedAt: parseInt(t.date.uts, 10) || 0,
     }))
     .filter(t => t.track && t.playedAt);
@@ -534,7 +552,7 @@ async function syncLastFm(memberUid, profileUrl, memberTeam) {
         if (recentFp.has(fp)) { duplicateCount++; continue; }
         recentFp.add(fp);
         acceptedCount++;
-        acceptedTracks.push({ name: l.track, artist: l.artist });
+        acceptedTracks.push({ name: l.track, artist: l.artist, album: l.album || '', playedAt: l.playedAt });
       }
       const recentFpArr = Array.from(recentFp).slice(-500);
 
@@ -603,6 +621,18 @@ async function syncLastFm(memberUid, profileUrl, memberTeam) {
       source: 'streaming', amount: out.earned, reason: `Last.fm: ${out.acceptedCount} verified streams`,
       relatedId: null, createdAt: new Date().toISOString(), createdBy: 'system',
     }).catch(()=>{});
+  }
+  if (db && out.acceptedTracks && out.acceptedTracks.length) {
+    const batch = db.batch();
+    for (const t of out.acceptedTracks) {
+      const logId = `${memberUid}_lastfm_${t.playedAt}_${Math.floor(Math.random()*10000)}`;
+      batch.set(db.collection('listensLog').doc(logId), {
+        memberUid, username, source: 'lastfm',
+        artist: t.artist, track: t.name, album: t.album || '',
+        listened_at: t.playedAt, createdAt: new Date().toISOString(),
+      });
+    }
+    await batch.commit().catch(()=>{});
   }
 
   return {
@@ -844,15 +874,39 @@ const server = http.createServer(async (req, res) => {
   }
 
   /* ── ListenBrainz-compatible listen history (read-back) ──
-     Pano Scrobbler's own "Scrobbles" tab calls this to display your
-     history back to you — a DIFFERENT feature from actually counting
-     streams (that's /1/submit-listens, above, and works independently
-     of this). We don't keep a full per-listen log (only dedup
-     fingerprints), so this returns a correctly-shaped but currently
-     empty response — enough to stop the "not supported" error, but
-     Pano Scrobbler's history view won't show real playback history. */
+     Pano Scrobbler's own "Scrobbles"/"Charts" tabs call this to display
+     your history back to you — a DIFFERENT feature from actually
+     counting streams (that's /1/submit-listens, above, and keeps
+     working independently of this). Now backed by a real listensLog
+     collection populated every time a stream is accepted, from any
+     source (ListenBrainz Instance, Webhook, or Last.fm). */
   if (pathname.match(/^\/1\/user\/[^/]+\/listens$/) && method === 'GET') {
-    return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
+    try {
+      const usernameFromPath = decodeURIComponent(pathname.split('/')[3]);
+      if (!db) return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
+      const memberSnap = await db.collection('members').where('username', '==', usernameFromPath).limit(1).get();
+      if (memberSnap.empty) return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
+      const uid = memberSnap.docs[0].id;
+      const count = Math.min(parseInt(parsed.query.count) || 25, 100);
+      // Equality-only query (no orderBy) deliberately avoids needing a
+      // manual composite index — sorts the bounded result client-side instead.
+      const logSnap = await db.collection('listensLog').where('memberUid', '==', uid).limit(500).get();
+      const all = logSnap.docs.map(d => d.data()).sort((a, b) => (b.listened_at || 0) - (a.listened_at || 0));
+      const page = all.slice(0, count);
+      return sendJSON(res, 200, {
+        payload: {
+          count: page.length,
+          listens: page.map(l => ({
+            listened_at: l.listened_at,
+            track_metadata: { artist_name: l.artist, track_name: l.track, release_name: l.album || undefined },
+          })),
+          latest_listen_ts: all.length ? all[0].listened_at : 0,
+          user_id: usernameFromPath,
+        },
+      });
+    } catch (e) {
+      return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
+    }
   }
 
   /* ── ListenBrainz-compatible submission endpoint ──
@@ -874,6 +928,7 @@ const server = http.createServer(async (req, res) => {
       const scrobbles = payload.map(p => ({
         artist: (p.track_metadata && p.track_metadata.artist_name) || '',
         track: (p.track_metadata && p.track_metadata.track_name) || '',
+        album: (p.track_metadata && p.track_metadata.release_name) || '',
         playedAt: p.listened_at || 0,
       })).filter(s => s.track && s.playedAt);
 
@@ -898,7 +953,7 @@ const server = http.createServer(async (req, res) => {
         const nowSec = Math.floor((body.time || Date.now()) / 1000);
         const scrobbles = songsRaw.map(s => {
           const p = s.processed || {}; const pa = s.parsed || {};
-          return { artist: p.artist || pa.artist || '', track: p.track || pa.track || '', playedAt: nowSec };
+          return { artist: p.artist || pa.artist || '', track: p.track || pa.track || '', album: p.album || pa.album || '', playedAt: nowSec };
         }).filter(s => s.track);
         if (scrobbles.length) await _processScrobbleBatch(member.uid, member.username, member.team, 'webhook', scrobbles);
       }
