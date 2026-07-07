@@ -882,11 +882,25 @@ const server = http.createServer(async (req, res) => {
      source (ListenBrainz Instance, Webhook, or Last.fm). */
   if (pathname.match(/^\/1\/user\/[^/]+\/listens$/) && method === 'GET') {
     try {
-      const usernameFromPath = decodeURIComponent(pathname.split('/')[3]);
       if (!db) return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
-      const memberSnap = await db.collection('members').where('username', '==', usernameFromPath).limit(1).get();
-      if (memberSnap.empty) return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
-      const uid = memberSnap.docs[0].id;
+      const usernameFromPath = decodeURIComponent(pathname.split('/')[3]);
+
+      // Identify the member primarily by the same Authorization token
+      // scrobblers already send on other requests — more reliable than
+      // trusting the URL's username segment always matches exactly.
+      let uid = null, resolvedUsername = usernameFromPath;
+      const authHeader = req.headers['authorization'] || '';
+      const token = authHeader.replace(/^Token\s+/i, '').trim();
+      if (token) {
+        const memberByToken = await _findMemberByPin(token);
+        if (memberByToken) { uid = memberByToken.uid; resolvedUsername = memberByToken.username; }
+      }
+      if (!uid) {
+        const memberSnap = await db.collection('members').where('username', '==', usernameFromPath).limit(1).get();
+        if (!memberSnap.empty) uid = memberSnap.docs[0].id;
+      }
+      if (!uid) return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
+
       const count = Math.min(parseInt(parsed.query.count) || 25, 100);
       // Equality-only query (no orderBy) deliberately avoids needing a
       // manual composite index — sorts the bounded result client-side instead.
@@ -901,7 +915,7 @@ const server = http.createServer(async (req, res) => {
             track_metadata: { artist_name: l.artist, track_name: l.track, release_name: l.album || undefined },
           })),
           latest_listen_ts: all.length ? all[0].listened_at : 0,
-          user_id: usernameFromPath,
+          user_id: resolvedUsername,
         },
       });
     } catch (e) {
