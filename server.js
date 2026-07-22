@@ -888,24 +888,32 @@ const server = http.createServer(async (req, res) => {
       // Identify the member primarily by the same Authorization token
       // scrobblers already send on other requests — more reliable than
       // trusting the URL's username segment always matches exactly.
-      let uid = null, resolvedUsername = usernameFromPath;
+      let uids = [], resolvedUsername = usernameFromPath;
       const authHeader = req.headers['authorization'] || '';
       const token = authHeader.replace(/^Token\s+/i, '').trim();
       if (token) {
         const memberByToken = await _findMemberByPin(token);
-        if (memberByToken) { uid = memberByToken.uid; resolvedUsername = memberByToken.username; }
+        if (memberByToken) { uids = [memberByToken.uid]; resolvedUsername = memberByToken.username; }
       }
-      if (!uid) {
-        const memberSnap = await db.collection('members').where('username', '==', usernameFromPath).limit(1).get();
-        if (!memberSnap.empty) uid = memberSnap.docs[0].id;
+      if (!uids.length) {
+        // Check ALL accounts matching this username, not just the first
+        // one found — if a duplicate-username situation exists, picking
+        // only one arbitrarily could miss the account that actually has
+        // the real listen history.
+        const memberSnap = await db.collection('members').where('username', '==', usernameFromPath).get();
+        uids = memberSnap.docs.map(d => d.id);
       }
-      if (!uid) return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
+      if (!uids.length) return sendJSON(res, 200, { payload: { count: 0, listens: [], latest_listen_ts: 0 } });
 
       const count = Math.min(parseInt(parsed.query.count) || 25, 100);
-      // Equality-only query (no orderBy) deliberately avoids needing a
-      // manual composite index — sorts the bounded result client-side instead.
-      const logSnap = await db.collection('listensLog').where('memberUid', '==', uid).limit(500).get();
-      const all = logSnap.docs.map(d => d.data()).sort((a, b) => (b.listened_at || 0) - (a.listened_at || 0));
+      // Equality-only query per uid (no orderBy) deliberately avoids needing
+      // a manual composite index — sorts the bounded result client-side.
+      let all = [];
+      for (const uid of uids) {
+        const logSnap = await db.collection('listensLog').where('memberUid', '==', uid).limit(500).get();
+        all = all.concat(logSnap.docs.map(d => d.data()));
+      }
+      all.sort((a, b) => (b.listened_at || 0) - (a.listened_at || 0));
       const page = all.slice(0, count);
       return sendJSON(res, 200, {
         payload: {
